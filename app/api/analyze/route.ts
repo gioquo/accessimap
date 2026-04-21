@@ -15,14 +15,14 @@ function toDeg(rad: number): number {
 function offsetPoint(
   lat: number,
   lng: number,
-  distanceMeters: number,
+  distanceM: number,
   bearingDeg: number
 ): { lat: number; lng: number } {
   const R = 6371000
   const brng = toRad(bearingDeg)
   const latRad = toRad(lat)
   const lngRad = toRad(lng)
-  const dR = distanceMeters / R
+  const dR = distanceM / R
   const newLat = Math.asin(
     Math.sin(latRad) * Math.cos(dR) + Math.cos(latRad) * Math.sin(dR) * Math.cos(brng)
   )
@@ -46,6 +46,16 @@ function bearingTo(lat1: number, lng1: number, lat2: number, lng2: number): numb
   return (toDeg(Math.atan2(y, x)) + 360) % 360
 }
 
+function distanceMeters(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const R = 6371000
+  const dLat = toRad(lat2 - lat1)
+  const dLng = toRad(lng2 - lng1)
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+}
+
 // ════════════════════════════════════════════════════
 // GOOGLE STREET VIEW
 // ════════════════════════════════════════════════════
@@ -55,7 +65,7 @@ interface StreetViewShot {
   observer_lat: number
   observer_lng: number
   heading: number
-  distance: number
+  distFromTarget: number
   description: string
 }
 
@@ -65,10 +75,12 @@ interface PanoInfo {
   pano_id: string
 }
 
-// Ritorna la posizione REALE del panorama Street View più vicino (solo outdoor, esclude indoor/musei)
-async function getStreetViewPano(lat: number, lng: number, radius = 50): Promise<PanoInfo | null> {
+// Cerca un panorama outdoor nel raggio specificato — esclude indoor (musei, attrazioni, interni)
+async function getStreetViewPano(lat: number, lng: number, radius: number): Promise<PanoInfo | null> {
   const key = process.env.GOOGLE_STREETVIEW_KEY
-  const url = `https://maps.googleapis.com/maps/api/streetview/metadata?location=${lat},${lng}&radius=${radius}&source=outdoor&key=${key}`
+  const url =
+    `https://maps.googleapis.com/maps/api/streetview/metadata` +
+    `?location=${lat},${lng}&radius=${radius}&source=outdoor&key=${key}`
   try {
     const res = await fetch(url)
     const data = await res.json()
@@ -83,67 +95,86 @@ function buildStreetViewUrl(
   lat: number,
   lng: number,
   heading: number,
+  pitch: number,
   fov = 65,
-  size = '640x640',
-  pitch = -15
+  size = '640x640'
 ): string {
   const key = process.env.GOOGLE_STREETVIEW_KEY
   return (
-    `https://maps.googleapis.com/maps/api/streetview?` +
-    `size=${size}&location=${lat},${lng}&heading=${heading.toFixed(1)}&fov=${fov}&pitch=${pitch}&source=outdoor&key=${key}`
+    `https://maps.googleapis.com/maps/api/streetview` +
+    `?size=${size}&location=${lat},${lng}` +
+    `&heading=${heading.toFixed(1)}&fov=${fov}&pitch=${pitch}&source=outdoor&key=${key}`
   )
 }
 
-// Genera shot con una prospettiva per angolazione, massimizzando la varietà di punti di vista.
-// Heading ricalcolato dalla posizione REALE del pano verso il target (non dalla posizione teorica).
-// Deduplica per pano_id: se 12m e 20m convergono allo stesso panorama, conta una volta sola.
+// Genera fino a 6 immagini Street View per un attraversamento.
+//
+// Strategia: cerca panorami partendo dal target stesso (non da posizioni teoriche),
+// con raggi crescenti e punti di ricerca nei 4 cardinali. Per ogni pano trovato
+// genera 3 shot (centro + sinistra + destra) a pitch decrescente con la distanza,
+// così si vede il cordolo anche in contesti con poca copertura.
 async function generateShots(targetLat: number, targetLng: number): Promise<StreetViewShot[]> {
-  const angles = [0, 60, 120, 180, 240, 300]
-  const angleNames = ['Nord', 'Nord-Est', 'Sud-Est', 'Sud', 'Sud-Ovest', 'Nord-Ovest']
-  const distances = [12, 20]
-
-  const primary: StreetViewShot[] = []   // primo disponibile per angolazione (preferibilmente 12m)
-  const secondary: StreetViewShot[] = [] // secondo per angolazione (20m dove esiste anche 12m)
+  const shots: StreetViewShot[] = []
   const seenPanos = new Set<string>()
 
-  for (let ai = 0; ai < angles.length; ai++) {
-    const angle = angles[ai]
-    const angleName = angleNames[ai]
-    let foundForAngle = false
+  // Punti di ricerca ordinati per priorità: target diretto → cardinali 15m → cardinali 30m → raggio largo
+  const searchPoints: Array<{ lat: number; lng: number; radius: number }> = [
+    { lat: targetLat, lng: targetLng, radius: 25 },
+  ]
+  for (const angle of [0, 90, 180, 270]) {
+    const p = offsetPoint(targetLat, targetLng, 15, angle)
+    searchPoints.push({ lat: p.lat, lng: p.lng, radius: 20 })
+  }
+  for (const angle of [0, 90, 180, 270]) {
+    const p = offsetPoint(targetLat, targetLng, 30, angle)
+    searchPoints.push({ lat: p.lat, lng: p.lng, radius: 20 })
+  }
+  // Ultimo tentativo: raggio largo direttamente al target
+  searchPoints.push({ lat: targetLat, lng: targetLng, radius: 80 })
 
-    for (const distance of distances) {
-      const observer = offsetPoint(targetLat, targetLng, distance, angle)
-      const pano = await getStreetViewPano(observer.lat, observer.lng)
-      if (!pano) continue
-      if (seenPanos.has(pano.pano_id)) continue
+  for (const sp of searchPoints) {
+    if (shots.length >= 6) break
 
-      seenPanos.add(pano.pano_id)
+    const pano = await getStreetViewPano(sp.lat, sp.lng, sp.radius)
+    if (!pano || seenPanos.has(pano.pano_id)) continue
+    seenPanos.add(pano.pano_id)
 
-      // Heading dalla posizione REALE del pano verso il target — corregge errori da snap
-      const heading = bearingTo(pano.lat, pano.lng, targetLat, targetLng)
-      // Pitch più inclinato verso il basso a distanza ravvicinata per mostrare il cordolo
-      const pitch = distance === 12 ? -15 : -10
+    const dist = distanceMeters(pano.lat, pano.lng, targetLat, targetLng)
+    const headingCenter = bearingTo(pano.lat, pano.lng, targetLat, targetLng)
 
-      const shot: StreetViewShot = {
-        url: buildStreetViewUrl(pano.lat, pano.lng, heading, 65, '640x640', pitch),
+    // Pitch adattivo: più inclinato verso il basso da vicino per vedere il cordolo
+    const pitchCenter = dist < 20 ? -20 : dist < 40 ? -15 : -10
+    const pitchSide = pitchCenter + 5 // leggermente meno inclinato sui lati
+
+    const panoCuts: Array<{ headingOffset: number; pitch: number; label: string }> =
+      seenPanos.size === 1
+        ? [
+            { headingOffset: 0, pitch: pitchCenter, label: 'centro' },
+            { headingOffset: -30, pitch: pitchSide, label: 'sinistra' },
+            { headingOffset: 30, pitch: pitchSide, label: 'destra' },
+          ]
+        : shots.length < 4
+        ? [
+            { headingOffset: 0, pitch: pitchCenter, label: 'centro' },
+            { headingOffset: -25, pitch: pitchSide, label: 'lato' },
+          ]
+        : [{ headingOffset: 0, pitch: pitchCenter, label: 'centro' }]
+
+    for (const cut of panoCuts) {
+      if (shots.length >= 6) break
+      const h = (headingCenter + cut.headingOffset + 360) % 360
+      shots.push({
+        url: buildStreetViewUrl(pano.lat, pano.lng, h, cut.pitch),
         observer_lat: pano.lat,
         observer_lng: pano.lng,
-        heading,
-        distance,
-        description: `Vista da ${distance}m ${angleName}`,
-      }
-
-      if (!foundForAngle) {
-        primary.push(shot)
-        foundForAngle = true
-      } else {
-        secondary.push(shot)
-      }
+        heading: h,
+        distFromTarget: Math.round(dist),
+        description: `Da ${Math.round(dist)}m, ${cut.label}, heading ${h.toFixed(0)}°, pitch ${cut.pitch}°`,
+      })
     }
   }
 
-  // Prima i primari (una per angolazione = massima varietà), poi i secondari come rinforzo
-  return [...primary, ...secondary].slice(0, 6)
+  return shots
 }
 
 async function imageToBase64(url: string) {
@@ -189,9 +220,8 @@ async function callGemini(
           body,
         })
         if (res.status === 503 || res.status === 429) {
-          const waitMs = attempt * 2000
           lastError = new Error(`${model} overloaded (${res.status})`)
-          await new Promise((r) => setTimeout(r, waitMs))
+          await new Promise((r) => setTimeout(r, attempt * 2000))
           continue
         }
         if (!res.ok) {
@@ -236,7 +266,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'crossing not found' }, { status: 404 })
     }
 
-    // 2. Cache
+    // 2. Cache (saltata se force=true)
     if (!force) {
       const { data: existing } = await supabaseServer
         .from('ai_analyses')
@@ -253,15 +283,15 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // 3. Prova Street View
-    console.log(`[Analyze] Generating Street View shots for (${crossing.lat}, ${crossing.lng})`)
+    // 3. Genera shot Street View
+    console.log(`[Analyze] Generating shots for (${crossing.lat}, ${crossing.lng})`)
     const shots = await generateShots(crossing.lat, crossing.lng)
-    console.log(`[Analyze] Got ${shots.length} valid Street View shots`)
+    console.log(`[Analyze] ${shots.length} shots found`)
 
-    let imagesData: Array<{ data: string; mimeType: string }> = []
-    let imageUrls: string[] = []
+    // 4. Scarica le immagini
+    const imagesData: Array<{ data: string; mimeType: string }> = []
+    const imageUrls: string[] = []
 
-    // 4. Scarica le immagini Street View
     for (const shot of shots) {
       try {
         const b64 = await imageToBase64(shot.url)
@@ -272,80 +302,81 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // 5. Costruisci il prompt
+    // 5. Costruisci prompt
     let prompt: string
+
     if (imagesData.length > 0) {
-      const shotDescriptions = shots
+      const shotList = shots
         .slice(0, imagesData.length)
-        .map(
-          (s, i) =>
-            `Immagine ${i + 1}: ${s.description}, heading ${s.heading.toFixed(0)}°, pitch ${s.distance === 12 ? '-15' : '-10'}°`
-        )
+        .map((s, i) => `  Immagine ${i + 1}: ${s.description}`)
         .join('\n')
 
-      prompt = `Sei un esperto di accessibilità urbana. Analizzi un attraversamento pedonale a Roma (${crossing.lat.toFixed(5)}, ${crossing.lng.toFixed(5)}).
+      prompt = `Sei un esperto di accessibilità urbana. Devi valutare se l'attraversamento pedonale alle coordinate ${crossing.lat.toFixed(5)}, ${crossing.lng.toFixed(5)} a Roma è accessibile a persone in carrozzina o con passeggino.
 
-Ti fornisco ${imagesData.length} immagini da Google Street View scattate da angolazioni diverse attorno al punto, con inclinazione verso il basso per mostrare il cordolo:
-${shotDescriptions}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-COSA CERCARE — RAMPE E CORDOLI:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Una rampa/scivolo è un abbassamento del cordolo che porta dal marciapiede alla strada:
-• Il bordo del marciapiede scende gradualmente fino all'asfalto (non è verticale)
-• Superficie in calcestruzzo grigio o asfalto, spesso con texture ruvida
-• A volte piastrelle tattili gialle/arancioni di fronte alla rampa
-• Larghezza tipica 80-150 cm
-
-Un cordolo SENZA rampa appare come un gradino verticale alto 5-15 cm tra marciapiede e strada.
+Hai ${imagesData.length} immagini Google Street View dell'area, scattate con inclinazione verso il basso per mostrare il bordo del marciapiede:
+${shotList}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PROCEDURA A DUE FASI — SEGUILA RIGOROSAMENTE:
+COSA IDENTIFICARE — RAMPE E CORDOLI
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ RAMPA PRESENTE (cordolo abbassato):
+  • Il bordo del marciapiede scende gradualmente fino al livello dell'asfalto
+  • Superficie inclinata in calcestruzzo o asfalto, spesso con texture ruvida
+  • A volte piastrelle tattili gialle/arancioni posizionate di fronte
+
+❌ NESSUNA RAMPA (cordolo rialzato):
+  • Il bordo del marciapiede forma un gradino verticale di 5-15 cm
+  • Transizione netta e brusca tra marciapiede e carreggiata
+
+⚠️ ATTENZIONE AGLI OSTACOLI TRANSITORI:
+  • Auto parcheggiate o persone NON invalidano la valutazione se il cordolo è visibile ai lati
+  • Valuta l'infrastruttura permanente, ignora veicoli e pedoni
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PROCEDURA (2 FASI OBBLIGATORIE)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-**FASE 1 — SCREENING QUALITÀ (OBBLIGATORIA)**
-Per OGNI immagine valuta se il cordolo/bordo marciapiede è visibile:
-- Un'auto parcheggiata davanti al cordolo NON scarta l'immagine se si vede il cordolo ai suoi lati o sotto
-- Scarta SOLO immagini dove il cordolo è totalmente invisibile (buio, solo cielo/muri/alberi, copertura totale)
+FASE 1 — SCREENING
+Per ogni immagine: il cordolo/bordo marciapiede è visibile anche parzialmente?
+Scarta solo immagini dove è completamente invisibile (buio totale, solo cielo/muri/alberi).
 
-**FASE 2 — VALUTAZIONE ACCESSIBILITÀ**
-Sulle immagini utili, valuta:
-- Il cordolo è abbassato (rampa) o verticale (nessuna rampa)?
-- Qualità del manto (crepe, buche, dislivelli significativi)
-- Presenza di pavimentazione tattile per ipovedenti
-- Larghezza del passaggio per carrozzina/passeggino (≥80 cm)
-- Ostacoli PERMANENTI (pali, fioriere, radici sporgenti) — ignora veicoli e persone
+FASE 2 — VALUTAZIONE (solo immagini utili)
+• Il cordolo è abbassato (rampa) o verticale (scalino)?
+• Condizioni del manto stradale e del marciapiede
+• Pavimentazione tattile per ipovedenti presente?
+• Larghezza del passaggio (sufficiente per carrozzina ≥80 cm?)
+• Ostacoli permanenti: pali, fioriere, radici sporgenti (NON auto/persone)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-FORMATO RISPOSTA OBBLIGATORIO:
+FORMATO RISPOSTA (rispetta esattamente)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-**Screening immagini**: quante e quali (per numero) sono utilizzabili, e perché le altre sono scartate (max 2 righe)
-**Cosa vedo**: descrizione concreta del cordolo/rampa nelle immagini utili (1-2 frasi)
+**Screening**: [immagini utili e perché le altre scartate, max 2 righe]
+**Cosa vedo**: [descrizione concreta del cordolo/rampa nelle immagini utili, 1-2 frasi]
 **Rampa presente**: Sì / No / Non visibile
-**Qualità**: Buona / Deteriorata / Parziale / Non valutabile
-**Ostacoli permanenti**: elenca o "nessuno"
+**Qualità manto**: Buona / Deteriorata / Parziale / Non valutabile
+**Ostacoli permanenti**: [elenco o "nessuno"]
 **Esito**: 🟢 Accessibile / 🟡 Parzialmente accessibile / 🔴 Non accessibile / ⚪ Non determinabile
 
-REGOLA: se meno di 2 immagini sono utilizzabili, rispondi sempre ⚪ Non determinabile.`
+REGOLA ASSOLUTA: se meno di 2 immagini sono utilizzabili → rispondi obbligatoriamente ⚪ Non determinabile.`
     } else {
       prompt = `Attraversamento pedonale a Roma (${crossing.lat.toFixed(5)}, ${crossing.lng.toFixed(5)}).
-Nessuna immagine disponibile (né Street View né Mapillary).
+Nessuna immagine Street View disponibile in un raggio di 80m.
 Tag OSM: ${JSON.stringify(crossing.osm_tags)}
 
-Rispondi: ⚪ Non determinabile (senza immagini non posso verificare visualmente).`
+**Esito**: ⚪ Non determinabile (nessuna immagine disponibile per questo punto).`
     }
 
     // 6. Chiama Gemini
     const aiResponse = await callGemini(prompt, imagesData)
 
-    // 7. Interpreta il verdetto
+    // 7. Verdetto
     let verdict: 'ok' | 'bad' | 'partial' | 'unknown' = 'unknown'
     if (aiResponse.includes('🟢')) verdict = 'ok'
     else if (aiResponse.includes('🔴')) verdict = 'bad'
     else if (aiResponse.includes('🟡')) verdict = 'partial'
     else if (aiResponse.includes('⚪')) verdict = 'unknown'
 
-    // 8. Salva in DB (image_urls richiede la colonna aggiunta via migrazione SQL)
+    // 8. Salva in DB
     const { data: savedAnalysis } = await supabaseServer
       .from('ai_analyses')
       .insert({
@@ -354,14 +385,14 @@ Rispondi: ⚪ Non determinabile (senza immagini non posso verificare visualmente
         image_urls: imageUrls,
         ai_verdict: verdict,
         ai_full_response: aiResponse,
-        model_used: `gemini-streetview`,
+        model_used: 'gemini-streetview',
       })
       .select()
       .single()
 
     await supabaseServer.from('crossings').update({ status: verdict }).eq('id', crossingId)
 
-    console.log(`[Analyze] ✓ ${crossingId} → ${verdict} (streetview, ${imagesData.length} imgs)`)
+    console.log(`[Analyze] ✓ crossing ${crossingId} → ${verdict} (${imagesData.length} imgs)`)
     return NextResponse.json({
       cached: false,
       analysis: savedAnalysis,
