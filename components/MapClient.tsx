@@ -21,6 +21,8 @@ export default function MapClient() {
   const [imageUrl, setImageUrl] = useState<string>('')
   const [loading, setLoading] = useState(false)
   const [imageUrls, setImageUrls] = useState<string[]>([])
+  const [customImages, setCustomImages] = useState<Array<{ data: string; mimeType: string; previewUrl: string }>>([])
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const [analyzing, setAnalyzing] = useState(false)
   const [batchRunning, setBatchRunning] = useState(false)
   const [batchProgress, setBatchProgress] = useState<{ done: number; total: number } | null>(null)
@@ -162,6 +164,7 @@ export default function MapClient() {
     setAnalysis('')
     setImageUrl('')
     setImageUrls([])
+    setCustomImages([])
     if (mapRef.current) {
       mapRef.current.setView([c.lat, c.lng], Math.max(mapRef.current.getZoom(), 17))
     }
@@ -183,6 +186,35 @@ export default function MapClient() {
         }
       })
       .catch(() => {})
+  }
+
+  function handleScreenshotUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0]
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = (ev) => {
+      const img = new Image()
+      img.onload = () => {
+        // Ridimensiona a max 640px mantenendo le proporzioni
+        const maxSize = 640
+        const scale = Math.min(1, maxSize / Math.max(img.width, img.height))
+        const w = Math.round(img.width * scale)
+        const h = Math.round(img.height * scale)
+        const canvas = document.createElement('canvas')
+        canvas.width = w
+        canvas.height = h
+        canvas.getContext('2d')!.drawImage(img, 0, 0, w, h)
+        const mimeType = 'image/jpeg'
+        const data = canvas.toDataURL(mimeType, 0.85).split(',')[1]
+        const previewUrl = canvas.toDataURL(mimeType, 0.7)
+        setCustomImages((prev) => [...prev, { data, mimeType, previewUrl }])
+        setImageUrl(previewUrl)
+      }
+      img.src = ev.target!.result as string
+    }
+    reader.readAsDataURL(file)
+    // Reset input per permettere di ricaricare lo stesso file
+    e.target.value = ''
   }
 
   async function manualOverride(verdict: CrossingStatus) {
@@ -208,7 +240,11 @@ export default function MapClient() {
       const res = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ crossingId: selected.id, force }),
+        body: JSON.stringify({
+          crossingId: selected.id,
+          force,
+          customImages: customImages.map(({ data, mimeType }) => ({ data, mimeType })),
+        }),
       })
       const data = await res.json()
       if (data.error) {
@@ -551,14 +587,54 @@ export default function MapClient() {
             )}
           </div>
 
-          <a
-            href={`https://www.google.com/maps?q=&layer=c&cbll=${selected.lat},${selected.lng}`}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex items-center justify-center gap-2 w-full bg-blue-500/10 border border-blue-500/30 text-blue-400 py-2 rounded-lg text-sm font-mono mb-3 hover:bg-blue-500/20 transition"
-          >
-            🗺 Apri Street View interattivo
-          </a>
+          <div className="flex gap-2 mb-3">
+            <a
+              href={`https://www.google.com/maps?q=&layer=c&cbll=${selected.lat},${selected.lng}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex-1 flex items-center justify-center gap-1.5 bg-blue-500/10 border border-blue-500/30 text-blue-400 py-2 rounded-lg text-sm font-mono hover:bg-blue-500/20 transition"
+            >
+              🗺 Street View
+            </a>
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              className="flex-1 flex items-center justify-center gap-1.5 bg-violet-500/10 border border-violet-500/30 text-violet-400 py-2 rounded-lg text-sm font-mono hover:bg-violet-500/20 transition"
+            >
+              📸 Carica screenshot
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              className="hidden"
+              onChange={handleScreenshotUpload}
+            />
+          </div>
+          {customImages.length > 0 && (
+            <div className="flex items-center gap-2 mb-2 flex-wrap">
+              <span className="text-[0.6rem] uppercase tracking-widest text-violet-400 font-mono">
+                📸 Screenshot ({customImages.length}):
+              </span>
+              {customImages.map((img, i) => (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img
+                  key={i}
+                  src={img.previewUrl}
+                  onClick={() => setImageUrl(img.previewUrl)}
+                  className={`h-12 w-12 object-contain bg-black rounded cursor-pointer border transition ${
+                    imageUrl === img.previewUrl ? 'border-violet-400' : 'border-violet-500/30 opacity-60 hover:opacity-100'
+                  }`}
+                  alt={`Screenshot ${i + 1}`}
+                />
+              ))}
+              <button
+                onClick={() => setCustomImages([])}
+                className="text-[0.6rem] text-rose-400 font-mono hover:text-rose-300"
+              >
+                ✕ rimuovi
+              </button>
+            </div>
+          )}
 
           {analysis && (
             <div className="bg-white/5 border border-white/10 rounded-lg p-3 mb-3 text-sm text-white leading-relaxed">
@@ -607,7 +683,13 @@ export default function MapClient() {
             disabled={analyzing}
             className="w-full bg-emerald-400 text-black py-3 rounded-lg font-bold disabled:opacity-50"
           >
-            {analyzing ? '⏳ Analisi in corso…' : analysis ? '🔄 Rianalizza' : '🤖 Analizza con AI'}
+            {analyzing
+              ? '⏳ Analisi in corso…'
+              : customImages.length > 0
+              ? `🤖 Analizza con AI (+${customImages.length} screenshot)`
+              : analysis
+              ? '🔄 Rianalizza'
+              : '🤖 Analizza con AI'}
           </button>
         </div>
       )}

@@ -110,15 +110,18 @@ function buildStreetViewUrl(
 
 // Genera fino a 6 immagini Street View per un attraversamento.
 //
-// Strategia: cerca panorami partendo dal target stesso (non da posizioni teoriche),
-// con raggi crescenti e punti di ricerca nei 4 cardinali. Per ogni pano trovato
-// genera 3 shot (centro + sinistra + destra) a pitch decrescente con la distanza,
-// così si vede il cordolo anche in contesti con poca copertura.
+// Caso pano ≈ target (dist < 8m): il bearing verso il target è inaffidabile (rumore su distanze
+// minime), quindi si usano le 4 direzioni cardinali assolute — almeno 2 saranno perpendicolari
+// alla strada e mostreranno il cordolo.
+//
+// Caso pano lontano: heading calcolato dal pano al target + variazioni ±35° per catturare
+// entrambi i lati dell'attraversamento. Mix di pitch: un colpo inclinato in basso per il
+// dettaglio del cordolo + colpi orizzontali (pitch 0°) per il contesto.
 async function generateShots(targetLat: number, targetLng: number): Promise<StreetViewShot[]> {
   const shots: StreetViewShot[] = []
   const seenPanos = new Set<string>()
 
-  // Punti di ricerca ordinati per priorità: target diretto → cardinali 15m → cardinali 30m → raggio largo
+  // Punti di ricerca: target diretto → 4 cardinali a 15m → 4 cardinali a 30m → fallback 80m
   const searchPoints: Array<{ lat: number; lng: number; radius: number }> = [
     { lat: targetLat, lng: targetLng, radius: 25 },
   ]
@@ -130,7 +133,6 @@ async function generateShots(targetLat: number, targetLng: number): Promise<Stre
     const p = offsetPoint(targetLat, targetLng, 30, angle)
     searchPoints.push({ lat: p.lat, lng: p.lng, radius: 20 })
   }
-  // Ultimo tentativo: raggio largo direttamente al target
   searchPoints.push({ lat: targetLat, lng: targetLng, radius: 80 })
 
   for (const sp of searchPoints) {
@@ -141,23 +143,44 @@ async function generateShots(targetLat: number, targetLng: number): Promise<Stre
     seenPanos.add(pano.pano_id)
 
     const dist = distanceMeters(pano.lat, pano.lng, targetLat, targetLng)
-    const headingCenter = bearingTo(pano.lat, pano.lng, targetLat, targetLng)
 
-    // Pitch adattivo: più inclinato verso il basso da vicino per vedere il cordolo
-    const pitchCenter = dist < 20 ? -20 : dist < 40 ? -15 : -10
-    const pitchSide = pitchCenter + 5 // leggermente meno inclinato sui lati
+    // Pano quasi sul crossing: heading verso target inaffidabile → 4 cardinali assolute
+    if (dist < 8) {
+      const cardinals = [
+        { h: 0, label: 'Nord' }, { h: 90, label: 'Est' },
+        { h: 180, label: 'Sud' }, { h: 270, label: 'Ovest' },
+      ]
+      for (const { h, label } of cardinals) {
+        if (shots.length >= 6) break
+        shots.push({
+          url: buildStreetViewUrl(pano.pano_id, h, -8),
+          pano_id: pano.pano_id,
+          observer_lat: pano.lat,
+          observer_lng: pano.lng,
+          heading: h,
+          distFromTarget: Math.round(dist),
+          description: `Vista ${label} (pano sul crossing, pitch -8°)`,
+        })
+      }
+      continue
+    }
+
+    // Pano lontano: heading verso target + variazioni ±35°
+    // Mix pitch: centro inclinato (vede cordolo) + lati orizzontali (contesto)
+    const headingCenter = bearingTo(pano.lat, pano.lng, targetLat, targetLng)
+    const pitchCenter = dist < 25 ? -18 : dist < 45 ? -12 : -8
 
     const panoCuts: Array<{ headingOffset: number; pitch: number; label: string }> =
       seenPanos.size === 1
         ? [
-            { headingOffset: 0, pitch: pitchCenter, label: 'centro' },
-            { headingOffset: -30, pitch: pitchSide, label: 'sinistra' },
-            { headingOffset: 30, pitch: pitchSide, label: 'destra' },
+            { headingOffset: 0, pitch: pitchCenter, label: 'centro (inclinato)' },
+            { headingOffset: -35, pitch: 0, label: 'sinistra (orizzontale)' },
+            { headingOffset: 35, pitch: 0, label: 'destra (orizzontale)' },
           ]
         : shots.length < 4
         ? [
             { headingOffset: 0, pitch: pitchCenter, label: 'centro' },
-            { headingOffset: -25, pitch: pitchSide, label: 'lato' },
+            { headingOffset: -30, pitch: 0, label: 'lato' },
           ]
         : [{ headingOffset: 0, pitch: pitchCenter, label: 'centro' }]
 
@@ -256,7 +279,8 @@ async function callGemini(
 
 export async function POST(req: NextRequest) {
   try {
-    const { crossingId, force } = await req.json()
+    const { crossingId, force, customImages } = await req.json()
+    const extraImages: Array<{ data: string; mimeType: string }> = Array.isArray(customImages) ? customImages : []
     if (!crossingId) {
       return NextResponse.json({ error: 'crossingId required' }, { status: 400 })
     }
@@ -307,14 +331,21 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // 5. Costruisci prompt
+    // 5. Aggiungi immagini personalizzate dell'utente (screenshot manuali)
+    if (extraImages.length > 0) {
+      imagesData.push(...extraImages)
+      console.log(`[Analyze] +${extraImages.length} custom images from user`)
+    }
+
+    // 6. Costruisci prompt
     let prompt: string
 
     if (imagesData.length > 0) {
-      const shotList = shots
-        .slice(0, imagesData.length)
-        .map((s, i) => `  Immagine ${i + 1}: ${s.description}`)
-        .join('\n')
+      const svCount = imagesData.length - extraImages.length
+      const shotList = [
+        ...shots.slice(0, svCount).map((s, i) => `  Immagine ${i + 1}: ${s.description}`),
+        ...extraImages.map((_, i) => `  Immagine ${svCount + i + 1}: screenshot manuale dell'utente`),
+      ].join('\n')
 
       prompt = `Sei un esperto di accessibilità urbana. Devi valutare se l'attraversamento pedonale alle coordinate ${crossing.lat.toFixed(5)}, ${crossing.lng.toFixed(5)} a Roma è accessibile a persone in carrozzina o con passeggino.
 
