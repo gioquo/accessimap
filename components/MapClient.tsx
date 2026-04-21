@@ -185,6 +185,22 @@ export default function MapClient() {
       .catch(() => {})
   }
 
+  async function manualOverride(verdict: CrossingStatus) {
+    if (!selected) return
+    try {
+      const res = await fetch('/api/analyze', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ crossingId: selected.id, verdict }),
+      })
+      const data = await res.json()
+      if (!data.error) {
+        setCrossings((prev) => prev.map((c) => (c.id === selected.id ? { ...c, status: verdict } : c)))
+        setSelected({ ...selected, status: verdict })
+      }
+    } catch {}
+  }
+
   async function analyzeSelected(force = false) {
     if (!selected) return
     setAnalyzing(true)
@@ -504,10 +520,10 @@ export default function MapClient() {
             {selected.lat.toFixed(6)}, {selected.lng.toFixed(6)}
           </div>
 
-          <div className="w-full bg-white/5 border border-white/10 rounded-xl overflow-hidden mb-3">
+          <div className="w-full bg-black border border-white/10 rounded-xl overflow-hidden mb-3">
             {imageUrl ? (
               // eslint-disable-next-line @next/next/no-img-element
-              <img src={imageUrl} alt="Vista stradale" className="w-full h-44 object-cover" />
+              <img src={imageUrl} alt="Vista stradale" className="w-full max-h-72 object-contain bg-black" />
             ) : (
               <div className="h-44 flex items-center justify-center text-center text-gray-400 text-xs font-mono p-4">
                 📷
@@ -516,14 +532,14 @@ export default function MapClient() {
               </div>
             )}
             {imageUrls.length > 1 && (
-              <div className="flex gap-1.5 p-2 overflow-x-auto bg-black/30">
+              <div className="flex gap-1.5 p-2 overflow-x-auto bg-black/50">
                 {imageUrls.map((url, i) => (
                   // eslint-disable-next-line @next/next/no-img-element
                   <img
                     key={i}
                     src={url}
                     onClick={() => setImageUrl(url)}
-                    className={`h-12 w-16 object-cover rounded cursor-pointer flex-shrink-0 border transition ${
+                    className={`h-14 w-14 object-contain bg-black rounded cursor-pointer flex-shrink-0 border transition ${
                       imageUrl === url
                         ? 'border-emerald-400 opacity-100'
                         : 'border-white/20 opacity-50 hover:opacity-100'
@@ -534,6 +550,15 @@ export default function MapClient() {
               </div>
             )}
           </div>
+
+          <a
+            href={`https://www.google.com/maps?q=&layer=c&cbll=${selected.lat},${selected.lng}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center justify-center gap-2 w-full bg-blue-500/10 border border-blue-500/30 text-blue-400 py-2 rounded-lg text-sm font-mono mb-3 hover:bg-blue-500/20 transition"
+          >
+            🗺 Apri Street View interattivo
+          </a>
 
           {analysis && (
             <div className="bg-white/5 border border-white/10 rounded-lg p-3 mb-3 text-sm text-white leading-relaxed">
@@ -552,6 +577,30 @@ export default function MapClient() {
               />
             </div>
           )}
+
+          <div className="flex gap-2 mb-3 items-center">
+            <span className="text-[0.6rem] uppercase tracking-widest text-gray-400 font-mono whitespace-nowrap">
+              Override manuale:
+            </span>
+            {(
+              [
+                { verdict: 'ok' as CrossingStatus, emoji: '🟢', label: 'Sì', cls: 'border-emerald-500/50 text-emerald-400 hover:bg-emerald-500/20' },
+                { verdict: 'partial' as CrossingStatus, emoji: '🟡', label: 'Parz.', cls: 'border-amber-500/50 text-amber-400 hover:bg-amber-500/20' },
+                { verdict: 'bad' as CrossingStatus, emoji: '🔴', label: 'No', cls: 'border-rose-500/50 text-rose-400 hover:bg-rose-500/20' },
+                { verdict: 'unknown' as CrossingStatus, emoji: '⚪', label: 'N/D', cls: 'border-white/20 text-gray-400 hover:bg-white/10' },
+              ] as const
+            ).map(({ verdict, emoji, label, cls }) => (
+              <button
+                key={verdict}
+                onClick={() => manualOverride(verdict)}
+                className={`flex-1 border rounded-lg py-1.5 text-xs font-mono transition ${cls} ${
+                  selected.status === verdict ? 'ring-1 ring-white/30 bg-white/5' : ''
+                }`}
+              >
+                {emoji} {label}
+              </button>
+            ))}
+          </div>
 
           <button
             onClick={() => analyzeSelected(!!analysis)}

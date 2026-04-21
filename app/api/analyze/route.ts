@@ -410,3 +410,26 @@ Tag OSM: ${JSON.stringify(crossing.osm_tags)}
     return NextResponse.json({ error: err.message }, { status: 500 })
   }
 }
+
+// Override manuale del verdetto da parte dell'utente
+export async function PATCH(req: NextRequest) {
+  try {
+    const { crossingId, verdict } = await req.json()
+    if (!crossingId || !['ok', 'bad', 'partial', 'unknown'].includes(verdict)) {
+      return NextResponse.json({ error: 'crossingId e verdict valido richiesti' }, { status: 400 })
+    }
+    await supabaseServer.from('crossings').update({ status: verdict }).eq('id', crossingId)
+    await supabaseServer.from('ai_analyses').insert({
+      crossing_id: crossingId,
+      image_url: null,
+      image_urls: [],
+      ai_verdict: verdict,
+      ai_full_response: `Verdetto impostato manualmente: ${verdict}`,
+      model_used: 'manual',
+    })
+    console.log(`[Analyze] Manual override crossing ${crossingId} → ${verdict}`)
+    return NextResponse.json({ ok: true, verdict })
+  } catch (err: any) {
+    return NextResponse.json({ error: err.message }, { status: 500 })
+  }
+}
