@@ -62,6 +62,7 @@ function distanceMeters(lat1: number, lng1: number, lat2: number, lng2: number):
 
 interface StreetViewShot {
   url: string
+  pano_id: string
   observer_lat: number
   observer_lng: number
   heading: number
@@ -91,9 +92,9 @@ async function getStreetViewPano(lat: number, lng: number, radius: number): Prom
   }
 }
 
+// Usa pano_id invece di location: garantisce il panorama esatto trovato dal metadata
 function buildStreetViewUrl(
-  lat: number,
-  lng: number,
+  pano_id: string,
   heading: number,
   pitch: number,
   fov = 65,
@@ -102,8 +103,8 @@ function buildStreetViewUrl(
   const key = process.env.GOOGLE_STREETVIEW_KEY
   return (
     `https://maps.googleapis.com/maps/api/streetview` +
-    `?size=${size}&location=${lat},${lng}` +
-    `&heading=${heading.toFixed(1)}&fov=${fov}&pitch=${pitch}&source=outdoor&key=${key}`
+    `?size=${size}&pano=${pano_id}` +
+    `&heading=${heading.toFixed(1)}&fov=${fov}&pitch=${pitch}&key=${key}`
   )
 }
 
@@ -164,7 +165,8 @@ async function generateShots(targetLat: number, targetLng: number): Promise<Stre
       if (shots.length >= 6) break
       const h = (headingCenter + cut.headingOffset + 360) % 360
       shots.push({
-        url: buildStreetViewUrl(pano.lat, pano.lng, h, cut.pitch),
+        url: buildStreetViewUrl(pano.pano_id, h, cut.pitch),
+        pano_id: pano.pano_id,
         observer_lat: pano.lat,
         observer_lng: pano.lng,
         heading: h,
@@ -179,7 +181,10 @@ async function generateShots(targetLat: number, targetLng: number): Promise<Stre
 
 async function imageToBase64(url: string) {
   const res = await fetch(url)
-  if (!res.ok) throw new Error(`Image fetch ${res.status}`)
+  if (!res.ok) {
+    const body = await res.text().catch(() => '')
+    throw new Error(`Image fetch ${res.status}: ${body.slice(0, 120)}`)
+  }
   const buf = await res.arrayBuffer()
   const base64 = Buffer.from(buf).toString('base64')
   const mimeType = res.headers.get('content-type') || 'image/jpeg'
@@ -298,7 +303,7 @@ export async function POST(req: NextRequest) {
         imagesData.push(b64)
         imageUrls.push(shot.url)
       } catch (e) {
-        console.log('[SV] fetch err:', e)
+        console.log('[SV] fetch err:', (e as Error).message)
       }
     }
 
