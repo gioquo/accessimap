@@ -65,10 +65,10 @@ interface PanoInfo {
   pano_id: string
 }
 
-// Ritorna la posizione REALE del panorama Street View più vicino (non quella teorica dell'osservatore)
+// Ritorna la posizione REALE del panorama Street View più vicino (solo outdoor, esclude indoor/musei)
 async function getStreetViewPano(lat: number, lng: number, radius = 50): Promise<PanoInfo | null> {
   const key = process.env.GOOGLE_STREETVIEW_KEY
-  const url = `https://maps.googleapis.com/maps/api/streetview/metadata?location=${lat},${lng}&radius=${radius}&key=${key}`
+  const url = `https://maps.googleapis.com/maps/api/streetview/metadata?location=${lat},${lng}&radius=${radius}&source=outdoor&key=${key}`
   try {
     const res = await fetch(url)
     const data = await res.json()
@@ -90,7 +90,7 @@ function buildStreetViewUrl(
   const key = process.env.GOOGLE_STREETVIEW_KEY
   return (
     `https://maps.googleapis.com/maps/api/streetview?` +
-    `size=${size}&location=${lat},${lng}&heading=${heading.toFixed(1)}&fov=${fov}&pitch=${pitch}&key=${key}`
+    `size=${size}&location=${lat},${lng}&heading=${heading.toFixed(1)}&fov=${fov}&pitch=${pitch}&source=outdoor&key=${key}`
   )
 }
 
@@ -153,29 +153,6 @@ async function imageToBase64(url: string) {
   const base64 = Buffer.from(buf).toString('base64')
   const mimeType = res.headers.get('content-type') || 'image/jpeg'
   return { data: base64, mimeType }
-}
-
-// ════════════════════════════════════════════════════
-// MAPILLARY FALLBACK
-// ════════════════════════════════════════════════════
-
-async function fetchMapillaryFallback(
-  targetLat: number,
-  targetLng: number
-): Promise<string[]> {
-  const token = process.env.MAPILLARY_TOKEN
-  if (!token) return []
-  try {
-    const bbox = `${targetLng - 0.002},${targetLat - 0.002},${targetLng + 0.002},${targetLat + 0.002}`
-    const url = `https://graph.mapillary.com/images?access_token=${token}&fields=id,thumb_1024_url&bbox=${bbox}&limit=3`
-    const res = await fetch(url)
-    const data = await res.json()
-    return (data.data || [])
-      .filter((img: any) => img.thumb_1024_url)
-      .map((img: any) => img.thumb_1024_url)
-  } catch {
-    return []
-  }
 }
 
 // ════════════════════════════════════════════════════
@@ -283,47 +260,28 @@ export async function POST(req: NextRequest) {
 
     let imagesData: Array<{ data: string; mimeType: string }> = []
     let imageUrls: string[] = []
-    let source = 'streetview'
 
-    if (shots.length > 0) {
-      for (const shot of shots) {
-        try {
-          const b64 = await imageToBase64(shot.url)
-          imagesData.push(b64)
-          imageUrls.push(shot.url)
-        } catch (e) {
-          console.log('[SV] fetch err:', e)
-        }
+    // 4. Scarica le immagini Street View
+    for (const shot of shots) {
+      try {
+        const b64 = await imageToBase64(shot.url)
+        imagesData.push(b64)
+        imageUrls.push(shot.url)
+      } catch (e) {
+        console.log('[SV] fetch err:', e)
       }
-    }
-
-    // 4. Fallback Mapillary
-    if (imagesData.length === 0) {
-      console.log('[Analyze] No Street View, trying Mapillary fallback')
-      const mlyUrls = await fetchMapillaryFallback(crossing.lat, crossing.lng)
-      for (const url of mlyUrls) {
-        try {
-          const b64 = await imageToBase64(url)
-          imagesData.push(b64)
-          imageUrls.push(url)
-        } catch (e) {}
-      }
-      source = 'mapillary'
     }
 
     // 5. Costruisci il prompt
     let prompt: string
     if (imagesData.length > 0) {
-      const shotDescriptions =
-        source === 'streetview'
-          ? shots
-              .slice(0, imagesData.length)
-              .map(
-                (s, i) =>
-                  `Immagine ${i + 1}: ${s.description}, heading ${s.heading.toFixed(0)}°, pitch ${s.distance === 12 ? '-15' : '-10'}°`
-              )
-              .join('\n')
-          : imagesData.map((_, i) => `Immagine ${i + 1}: vista Mapillary`).join('\n')
+      const shotDescriptions = shots
+        .slice(0, imagesData.length)
+        .map(
+          (s, i) =>
+            `Immagine ${i + 1}: ${s.description}, heading ${s.heading.toFixed(0)}°, pitch ${s.distance === 12 ? '-15' : '-10'}°`
+        )
+        .join('\n')
 
       prompt = `Sei un esperto di accessibilità urbana. Analizzi un attraversamento pedonale a Roma (${crossing.lat.toFixed(5)}, ${crossing.lng.toFixed(5)}).
 
@@ -396,19 +354,18 @@ Rispondi: ⚪ Non determinabile (senza immagini non posso verificare visualmente
         image_urls: imageUrls,
         ai_verdict: verdict,
         ai_full_response: aiResponse,
-        model_used: `gemini-${source}`,
+        model_used: `gemini-streetview`,
       })
       .select()
       .single()
 
     await supabaseServer.from('crossings').update({ status: verdict }).eq('id', crossingId)
 
-    console.log(`[Analyze] ✓ ${crossingId} → ${verdict} (${source}, ${imagesData.length} imgs)`)
+    console.log(`[Analyze] ✓ ${crossingId} → ${verdict} (streetview, ${imagesData.length} imgs)`)
     return NextResponse.json({
       cached: false,
       analysis: savedAnalysis,
       crossing: { ...crossing, status: verdict },
-      source,
       imagesUsed: imagesData.length,
       imageUrls,
     })
