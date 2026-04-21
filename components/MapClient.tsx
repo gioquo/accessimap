@@ -20,6 +20,7 @@ export default function MapClient() {
   const [analysis, setAnalysis] = useState<string>('')
   const [imageUrl, setImageUrl] = useState<string>('')
   const [loading, setLoading] = useState(false)
+  const [imageUrls, setImageUrls] = useState<string[]>([])
   const [analyzing, setAnalyzing] = useState(false)
   const [batchRunning, setBatchRunning] = useState(false)
   const [batchProgress, setBatchProgress] = useState<{ done: number; total: number } | null>(null)
@@ -160,6 +161,7 @@ export default function MapClient() {
     setSelected(c)
     setAnalysis('')
     setImageUrl('')
+    setImageUrls([])
     if (mapRef.current) {
       mapRef.current.setView([c.lat, c.lng], Math.max(mapRef.current.getZoom(), 17))
     }
@@ -175,7 +177,9 @@ export default function MapClient() {
       .then((data) => {
         if (data.cached && data.analysis) {
           setAnalysis(data.analysis.ai_full_response)
-          setImageUrl(data.analysis.image_url || '')
+          const urls: string[] = data.imageUrls || (data.analysis.image_url ? [data.analysis.image_url] : [])
+          setImageUrls(urls)
+          setImageUrl(urls[0] || '')
         }
       })
       .catch(() => {})
@@ -195,7 +199,9 @@ export default function MapClient() {
         alert('Errore AI: ' + data.error)
       } else {
         setAnalysis(data.analysis.ai_full_response)
-        setImageUrl(data.analysis.image_url || '')
+        const urls: string[] = data.imageUrls || (data.analysis.image_url ? [data.analysis.image_url] : [])
+        setImageUrls(urls)
+        setImageUrl(urls[0] || '')
         const newStatus = data.crossing.status
         setCrossings((prev) =>
           prev.map((c) => (c.id === selected.id ? { ...c, status: newStatus } : c))
@@ -498,15 +504,33 @@ export default function MapClient() {
             {selected.lat.toFixed(6)}, {selected.lng.toFixed(6)}
           </div>
 
-          <div className="w-full h-44 bg-white/5 border border-white/10 rounded-xl overflow-hidden mb-3 flex items-center justify-center">
+          <div className="w-full bg-white/5 border border-white/10 rounded-xl overflow-hidden mb-3">
             {imageUrl ? (
               // eslint-disable-next-line @next/next/no-img-element
-              <img src={imageUrl} alt="Vista stradale" className="w-full h-full object-cover" />
+              <img src={imageUrl} alt="Vista stradale" className="w-full h-44 object-cover" />
             ) : (
-              <div className="text-center text-gray-400 text-xs font-mono p-4">
+              <div className="h-44 flex items-center justify-center text-center text-gray-400 text-xs font-mono p-4">
                 📷
                 <br />
                 Premi Analizza per caricare
+              </div>
+            )}
+            {imageUrls.length > 1 && (
+              <div className="flex gap-1.5 p-2 overflow-x-auto bg-black/30">
+                {imageUrls.map((url, i) => (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    key={i}
+                    src={url}
+                    onClick={() => setImageUrl(url)}
+                    className={`h-12 w-16 object-cover rounded cursor-pointer flex-shrink-0 border transition ${
+                      imageUrl === url
+                        ? 'border-emerald-400 opacity-100'
+                        : 'border-white/20 opacity-50 hover:opacity-100'
+                    }`}
+                    alt={`Vista ${i + 1}`}
+                  />
+                ))}
               </div>
             )}
           </div>
@@ -519,6 +543,9 @@ export default function MapClient() {
               <div
                 dangerouslySetInnerHTML={{
                   __html: analysis
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;')
                     .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
                     .replace(/\n/g, '<br>'),
                 }}
