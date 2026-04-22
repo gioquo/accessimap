@@ -1,92 +1,43 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { supabaseServer } from '@/lib/supabase-server'
-
-// ════════════════════════════════════════════════════
-// UTILITIES GEOGRAFICHE
-// ════════════════════════════════════════════════════
-
-function toRad(deg: number) { return (deg * Math.PI) / 180 }
-function toDeg(rad: number) { return (rad * 180) / Math.PI }
-
-function offsetPoint(lat: number, lng: number, distM: number, bearingDeg: number) {
-  const R = 6371000
-  const brng = toRad(bearingDeg)
-  const latR = toRad(lat); const lngR = toRad(lng)
-  const dR = distM / R
-  const newLat = Math.asin(Math.sin(latR) * Math.cos(dR) + Math.cos(latR) * Math.sin(dR) * Math.cos(brng))
-  const newLng = lngR + Math.atan2(Math.sin(brng) * Math.sin(dR) * Math.cos(latR), Math.cos(dR) - Math.sin(latR) * Math.sin(newLat))
-  return { lat: toDeg(newLat), lng: toDeg(newLng) }
-}
-
-function bearingTo(lat1: number, lng1: number, lat2: number, lng2: number) {
-  const dLng = toRad(lng2 - lng1)
-  const y = Math.sin(dLng) * Math.cos(toRad(lat2))
-  const x = Math.cos(toRad(lat1)) * Math.sin(toRad(lat2)) - Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(dLng)
-  return (toDeg(Math.atan2(y, x)) + 360) % 360
-}
-
-function distanceMeters(lat1: number, lng1: number, lat2: number, lng2: number) {
-  const R = 6371000
-  const dLat = toRad(lat2 - lat1); const dLng = toRad(lng2 - lng1)
-  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
-}
-
-// Pitch fisico: arctan(altezza camera / distanza) = angolo per puntare al suolo alla distanza target
-function pitchForDist(dist: number) {
-  return -Math.round(Math.atan2(1.4, Math.max(dist, 3)) * 180 / Math.PI)
-}
+import { toRad, offsetPoint, bearingTo, distanceMeters, pitchForDist } from '@/lib/geo'
+import { queryOverpass } from '@/lib/overpass'
+import { rateLimit } from '@/lib/rate-limit'
 
 // ════════════════════════════════════════════════════
 // DIREZIONE STRADALE DA OSM
-// Interroga Overpass per trovare la strada che contiene il nodo del crossing.
-// Restituisce il bearing (gradi) della strada → usato per posizionare le
-// fotocamere Street View perpendicolarmente alla strada, guardando le rampe.
+// Restituisce il bearing della strada che contiene il nodo del crossing.
 // ════════════════════════════════════════════════════
-
-const OVERPASS_ENDPOINTS = [
-  'https://overpass-api.de/api/interpreter',
-  'https://overpass.kumi.systems/api/interpreter',
-  'https://overpass.private.coffee/api/interpreter',
-]
 
 async function getRoadBearing(osmId: number | null, lat: number, lng: number): Promise<number | null> {
   if (!osmId) return null
   const query = `[out:json][timeout:8];node(${osmId});way(bn)["highway"];out geom;`
-  for (const endpoint of OVERPASS_ENDPOINTS) {
-    try {
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'AccessiMap/1.0' },
-        body: 'data=' + encodeURIComponent(query),
-        signal: AbortSignal.timeout(7000),
-      })
-      if (!res.ok) continue
-      const data = await res.json()
-      const ways = (data.elements || []).filter(
-        (el: any) => el.type === 'way' && Array.isArray(el.geometry) && el.geometry.length >= 2
-      )
-      if (ways.length === 0) return null
+  try {
+    const data = await queryOverpass(query, { timeoutMs: 7000 })
+    const ways = (data.elements || []).filter(
+      (el: any) => el.type === 'way' && Array.isArray(el.geometry) && el.geometry.length >= 2
+    )
+    if (ways.length === 0) return null
 
-      const geom: Array<{ lat: number; lon: number }> = ways[0].geometry
+    const geom: Array<{ lat: number; lon: number }> = ways[0].geometry
 
-      // Trova il segmento del way più vicino al crossing
-      let minDist = Infinity, closestIdx = 0
-      for (let i = 0; i < geom.length; i++) {
-        const d = distanceMeters(geom[i].lat, geom[i].lon, lat, lng)
-        if (d < minDist) { minDist = d; closestIdx = i }
-      }
-      const i1 = Math.max(0, closestIdx - 1)
-      const i2 = Math.min(geom.length - 1, closestIdx + 1)
-      if (i1 === i2) return null
+    // Trova il segmento del way più vicino al crossing
+    let minDist = Infinity, closestIdx = 0
+    for (let i = 0; i < geom.length; i++) {
+      const d = distanceMeters(geom[i].lat, geom[i].lon, lat, lng)
+      if (d < minDist) { minDist = d; closestIdx = i }
+    }
+    const i1 = Math.max(0, closestIdx - 1)
+    const i2 = Math.min(geom.length - 1, closestIdx + 1)
+    if (i1 === i2) return null
 
-      const b = bearingTo(geom[i1].lat, geom[i1].lon, geom[i2].lat, geom[i2].lon)
-      console.log(`[Road] osm_id=${osmId} bearing=${b.toFixed(0)}° (via ${endpoint.split('/')[2]})`)
-      return b
-    } catch { continue }
+    const b = bearingTo(geom[i1].lat, geom[i1].lon, geom[i2].lat, geom[i2].lon)
+    console.log(`[Road] osm_id=${osmId} bearing=${b.toFixed(0)}°`)
+    return b
+  } catch {
+    console.log(`[Road] osm_id=${osmId} — bearing non trovato`)
+    return null
   }
-  console.log(`[Road] osm_id=${osmId} — bearing non trovato`)
-  return null
 }
 
 // ════════════════════════════════════════════════════
@@ -415,19 +366,62 @@ async function callGemini(prompt: string, images: Array<{ data: string; mimeType
 // PIPELINE PRINCIPALE
 // ════════════════════════════════════════════════════
 
-export async function POST(req: NextRequest) {
-  try {
-    const { crossingId, force, customImages } = await req.json()
-    if (!crossingId) return NextResponse.json({ error: 'crossingId required' }, { status: 400 })
+// Helper: valida e parsea un crossingId da request body o query
+function parseCrossingId(raw: unknown): number | null {
+  const n = typeof raw === 'number' ? raw : parseInt(String(raw), 10)
+  return Number.isInteger(n) && n > 0 ? n : null
+}
 
-    const extraImages: Array<{ data: string; mimeType: string }> = Array.isArray(customImages) ? customImages : []
+// GET /api/analyze?crossingId=X — lettura SOLO della cache, NON triggera analisi.
+// Usato dal frontend al click su un punto: niente spreco API se l'analisi
+// esiste già in DB. Ritorna 404 se non c'è cache.
+export async function GET(req: NextRequest) {
+  const rl = rateLimit(req, 'analyze-get', 120, 60_000)
+  if (!rl.ok) {
+    return NextResponse.json({ error: 'Troppe richieste' }, { status: 429 })
+  }
+
+  const { searchParams } = new URL(req.url)
+  const crossingId = parseCrossingId(searchParams.get('crossingId'))
+  if (!crossingId) return NextResponse.json({ error: 'crossingId non valido' }, { status: 400 })
+
+  const [{ data: crossing }, { data: existing }] = await Promise.all([
+    supabaseServer.from('crossings').select('*').eq('id', crossingId).single(),
+    supabaseServer.from('ai_analyses').select('*').eq('crossing_id', crossingId)
+      .order('created_at', { ascending: false }).limit(1).maybeSingle(),
+  ])
+
+  if (!crossing) return NextResponse.json({ error: 'crossing not found' }, { status: 404 })
+  if (!existing) return NextResponse.json({ cached: false, crossing, imageUrls: [] }, { status: 200 })
+
+  const cachedUrls: string[] = existing.image_urls || (existing.image_url ? [existing.image_url] : [])
+  return NextResponse.json({ cached: true, analysis: existing, crossing, imageUrls: cachedUrls })
+}
+
+export async function POST(req: NextRequest) {
+  // Rate limit aggressivo: ogni POST consuma Gemini + Google + Esri/Overpass
+  const rl = rateLimit(req, 'analyze-post', 20, 60_000)
+  if (!rl.ok) {
+    return NextResponse.json({ error: 'Troppe analisi, riprova tra poco' }, { status: 429 })
+  }
+
+  try {
+    const body = await req.json().catch(() => ({}))
+    const crossingId = parseCrossingId(body.crossingId)
+    if (!crossingId) return NextResponse.json({ error: 'crossingId non valido' }, { status: 400 })
+
+    const force = !!body.force
+    const customImages = body.customImages
+    const extraImages: Array<{ data: string; mimeType: string }> = Array.isArray(customImages)
+      ? customImages.filter((i: any) => typeof i?.data === 'string' && typeof i?.mimeType === 'string').slice(0, 5)
+      : []
 
     // 1. Crossing
     const { data: crossing, error: crossErr } = await supabaseServer
       .from('crossings').select('*').eq('id', crossingId).single()
     if (crossErr || !crossing) return NextResponse.json({ error: 'crossing not found' }, { status: 404 })
 
-    // 2. Cache
+    // 2. Cache (saltata se force=true)
     if (!force) {
       const { data: existing } = await supabaseServer
         .from('ai_analyses').select('*').eq('crossing_id', crossingId)
@@ -610,11 +604,19 @@ Dati OSM: ${JSON.stringify(crossing.osm_tags)}
   }
 }
 
-// Override manuale del verdetto
+// Override manuale del verdetto da parte dell'utente
 export async function PATCH(req: NextRequest) {
+  const rl = rateLimit(req, 'analyze-patch', 60, 60_000)
+  if (!rl.ok) {
+    return NextResponse.json({ error: 'Troppe richieste' }, { status: 429 })
+  }
+
   try {
-    const { crossingId, verdict } = await req.json()
-    if (!crossingId || !['ok', 'bad', 'partial', 'unknown'].includes(verdict)) {
+    const body = await req.json().catch(() => ({}))
+    const crossingId = parseCrossingId(body.crossingId)
+    const verdict = body.verdict
+    const VALID = ['ok', 'bad', 'partial', 'unknown'] as const
+    if (!crossingId || typeof verdict !== 'string' || !VALID.includes(verdict as any)) {
       return NextResponse.json({ error: 'params invalidi' }, { status: 400 })
     }
     await supabaseServer.from('crossings').update({ status: verdict }).eq('id', crossingId)

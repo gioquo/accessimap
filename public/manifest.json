@@ -1,0 +1,17 @@
+{
+  "name": "AccessiMap — Rampe Roma",
+  "short_name": "AccessiMap",
+  "description": "Mappa accessibilità attraversamenti pedonali a Roma",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0a0a0a",
+  "theme_color": "#0d0e10",
+  "icons": [
+    {
+      "src": "/favicon.ico",
+      "sizes": "any",
+      "type": "image/x-icon"
+    }
+  ]
+}

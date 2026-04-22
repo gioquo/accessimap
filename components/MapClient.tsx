@@ -1,7 +1,10 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
+import type { Map as LeafletMap, Marker, Circle, TileLayer, LeafletMouseEvent } from 'leaflet'
 import type { Crossing, CrossingStatus } from '../lib/types'
+import { showToast } from './Toast'
+import { usePersistedState } from '../lib/use-persisted-state'
 
 const COLORS: Record<CrossingStatus, string> = {
   ok: '#00e5a0',
@@ -11,12 +14,14 @@ const COLORS: Record<CrossingStatus, string> = {
 }
 
 export default function MapClient() {
-  const mapRef = useRef<any>(null)
-  const markersRef = useRef<any[]>([])
-  const circleRef = useRef<any>(null)
-  const [L, setL] = useState<any>(null)
+  const mapRef = useRef<LeafletMap | null>(null)
+  const markersRef = useRef<Marker[]>([])
+  const circleRef = useRef<Circle | null>(null)
+  const [L, setL] = useState<typeof import('leaflet') | null>(null)
   const [crossings, setCrossings] = useState<Crossing[]>([])
   const [selected, setSelected] = useState<Crossing | null>(null)
+  // Ref del crossing attualmente selezionato — serve per ignorare risposte async stale
+  const selectedIdRef = useRef<number | null>(null)
   const [analysis, setAnalysis] = useState<string>('')
   const [imageUrl, setImageUrl] = useState<string>('')
   const [loading, setLoading] = useState(false)
@@ -27,13 +32,14 @@ export default function MapClient() {
   const [batchRunning, setBatchRunning] = useState(false)
   const [batchProgress, setBatchProgress] = useState<{ done: number; total: number } | null>(null)
   const [sidebarOpen, setSidebarOpen] = useState(false)
-  const [radius, setRadius] = useState(500)
-  const [center, setCenter] = useState<[number, number]>([41.8902, 12.4922])
-  const [locationLabel, setLocationLabel] = useState('📍 Colosseo, Roma')
+  // Preferenze persistite in localStorage
+  const [radius, setRadius] = usePersistedState<number>('accessimap.radius', 500)
+  const [center, setCenter] = usePersistedState<[number, number]>('accessimap.center', [41.8902, 12.4922])
+  const [locationLabel, setLocationLabel] = usePersistedState<string>('accessimap.label', '📍 Colosseo, Roma')
+  const [isSatellite, setIsSatellite] = usePersistedState<boolean>('accessimap.satellite', true)
   const [zone, setZone] = useState('')
-  const [isSatellite, setIsSatellite] = useState(true)
-  const satLayerRef = useRef<any>(null)
-  const streetLayerRef = useRef<any>(null)
+  const satLayerRef = useRef<TileLayer | null>(null)
+  const streetLayerRef = useRef<TileLayer | null>(null)
 
   useEffect(() => {
     import('leaflet').then((leaflet) => {
@@ -55,7 +61,8 @@ export default function MapClient() {
       { attribution: '© Esri, Maxar', maxZoom: 19 }
     )
 
-    satLayerRef.current.addTo(map)
+    // Layer iniziale rispetta la preferenza salvata
+    ;(isSatellite ? satLayerRef.current : streetLayerRef.current).addTo(map)
 
     circleRef.current = L.circle(center, {
       radius,
@@ -66,7 +73,7 @@ export default function MapClient() {
       dashArray: '5 4',
     }).addTo(map)
 
-    map.on('click', (e: any) => {
+    map.on('click', (e: LeafletMouseEvent) => {
       const newCenter: [number, number] = [e.latlng.lat, e.latlng.lng]
       setCenter(newCenter)
       setLocationLabel(`📍 ${e.latlng.lat.toFixed(5)}, ${e.latlng.lng.toFixed(5)}`)
@@ -85,23 +92,20 @@ export default function MapClient() {
       window.removeEventListener('resize', onResize)
       window.removeEventListener('orientationchange', onResize)
     }
+    // Init mappa: deve essere eseguito una sola volta quando L è pronto.
+    // center/radius/isSatellite sono presi dalla persistenza al mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [L])
 
+  // Aggiorna SOLO il raggio del cerchio (no ricreazione layer) ad ogni cambio
   useEffect(() => {
-    if (!mapRef.current || !circleRef.current || !L) return
-    mapRef.current.removeLayer(circleRef.current)
-    circleRef.current = L.circle(center, {
-      radius,
-      color: '#00e5a0',
-      fillColor: '#00e5a0',
-      fillOpacity: 0.06,
-      weight: 1.5,
-      dashArray: '5 4',
-    }).addTo(mapRef.current)
-  }, [center, radius, L])
+    if (!circleRef.current) return
+    circleRef.current.setLatLng(center)
+    circleRef.current.setRadius(radius)
+  }, [center, radius])
 
   function toggleLayer() {
-    if (!mapRef.current || !L) return
+    if (!mapRef.current || !satLayerRef.current || !streetLayerRef.current) return
     if (isSatellite) {
       mapRef.current.removeLayer(satLayerRef.current)
       streetLayerRef.current.addTo(mapRef.current)
@@ -113,9 +117,10 @@ export default function MapClient() {
   }
 
   useEffect(() => {
-    if (!mapRef.current || !L) return
+    const map = mapRef.current
+    if (!map || !L) return
 
-    markersRef.current.forEach((m) => mapRef.current.removeLayer(m))
+    markersRef.current.forEach((m) => map.removeLayer(m))
     markersRef.current = []
 
     crossings.forEach((c) => {
@@ -129,7 +134,7 @@ export default function MapClient() {
         className: '',
       })
       const marker = L.marker([c.lat, c.lng], { icon })
-        .addTo(mapRef.current)
+        .addTo(map)
         .on('click', () => selectCrossing(c))
       markersRef.current.push(marker)
     })
@@ -143,9 +148,16 @@ export default function MapClient() {
         `/api/crossings?lat=${center[0]}&lng=${center[1]}&radius=${radius}`
       )
       const data = await res.json()
-      setCrossings(data.crossings || [])
-      if (data.warning) {
-        console.warn('Warning:', data.warning)
+      if (res.status === 429) {
+        showToast('Troppe richieste, riprova tra poco', 'error')
+      } else if (data.error) {
+        showToast('Errore: ' + data.error, 'error')
+      } else {
+        setCrossings(data.crossings || [])
+        if (data.warning) showToast(data.warning, 'info')
+        else if ((data.crossings || []).length === 0) {
+          showToast('Nessun attraversamento trovato in questa zona', 'info')
+        }
       }
       setTimeout(() => {
         if (markersRef.current.length > 0 && mapRef.current && L) {
@@ -153,14 +165,15 @@ export default function MapClient() {
           mapRef.current.fitBounds(g.getBounds().pad(0.15))
         }
       }, 100)
-    } catch (err) {
-      alert('Errore nel caricamento punti.')
+    } catch {
+      showToast('Errore di rete nel caricamento punti', 'error')
     }
     setLoading(false)
   }
 
   function selectCrossing(c: Crossing) {
     setSelected(c)
+    selectedIdRef.current = c.id  // marca quale crossing è "attivo" per ignorare risposte stale
     setAnalysis('')
     setImageUrl('')
     setImageUrls([])
@@ -170,14 +183,13 @@ export default function MapClient() {
     }
     setSidebarOpen(false)
 
-    // Carica l'analisi esistente se c'è
-    fetch(`/api/analyze`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ crossingId: c.id }),
-    })
+    // GET = solo lettura cache, NON triggera analisi automatica.
+    // Race-condition guard: se l'utente clicca un altro punto prima che la fetch finisca,
+    // ignora questa risposta (non sovrascrivere l'analisi del punto nuovo).
+    fetch(`/api/analyze?crossingId=${c.id}`)
       .then((r) => r.json())
       .then((data) => {
+        if (selectedIdRef.current !== c.id) return // utente è andato altrove → scarta
         if (data.cached && data.analysis) {
           setAnalysis(data.analysis.ai_full_response)
           const urls: string[] = data.imageUrls || (data.analysis.image_url ? [data.analysis.image_url] : [])
@@ -219,6 +231,7 @@ export default function MapClient() {
 
   async function manualOverride(verdict: CrossingStatus) {
     if (!selected) return
+    const requestId = selected.id
     try {
       const res = await fetch('/api/analyze', {
         method: 'PATCH',
@@ -226,15 +239,23 @@ export default function MapClient() {
         body: JSON.stringify({ crossingId: selected.id, verdict }),
       })
       const data = await res.json()
-      if (!data.error) {
-        setCrossings((prev) => prev.map((c) => (c.id === selected.id ? { ...c, status: verdict } : c)))
-        setSelected({ ...selected, status: verdict })
+      if (data.error) {
+        showToast(data.error, 'error')
+      } else {
+        setCrossings((prev) => prev.map((c) => (c.id === requestId ? { ...c, status: verdict } : c)))
+        if (selectedIdRef.current === requestId) {
+          setSelected((s) => (s?.id === requestId ? { ...s, status: verdict } : s))
+        }
+        showToast('Verdetto aggiornato', 'success')
       }
-    } catch {}
+    } catch {
+      showToast('Errore di rete', 'error')
+    }
   }
 
   async function analyzeSelected(force = false) {
     if (!selected) return
+    const requestId = selected.id  // snapshot per race-guard
     setAnalyzing(true)
     try {
       const res = await fetch('/api/analyze', {
@@ -248,20 +269,22 @@ export default function MapClient() {
       })
       const data = await res.json()
       if (data.error) {
-        alert('Errore AI: ' + data.error)
-      } else {
+        showToast('Errore AI: ' + data.error, 'error')
+      } else if (selectedIdRef.current === requestId) {
+        // applica risultati solo se l'utente è ancora sullo stesso punto
         setAnalysis(data.analysis.ai_full_response)
         const urls: string[] = data.imageUrls || (data.analysis.image_url ? [data.analysis.image_url] : [])
         setImageUrls(urls)
         setImageUrl(urls[0] || '')
         const newStatus = data.crossing.status
         setCrossings((prev) =>
-          prev.map((c) => (c.id === selected.id ? { ...c, status: newStatus } : c))
+          prev.map((c) => (c.id === requestId ? { ...c, status: newStatus } : c))
         )
-        setSelected({ ...selected, status: newStatus })
+        setSelected((s) => (s?.id === requestId ? { ...s, status: newStatus } : s))
+        showToast('Analisi completata', 'success')
       }
-    } catch (err) {
-      alert('Errore di rete.')
+    } catch {
+      showToast('Errore di rete', 'error')
     }
     setAnalyzing(false)
   }
@@ -269,7 +292,7 @@ export default function MapClient() {
   async function analyzeBatch() {
     const pending = crossings.filter((c) => c.status === 'unknown').slice(0, 10)
     if (pending.length === 0) {
-      alert('Tutti i punti sono già stati analizzati!')
+      showToast('Tutti i punti sono già stati analizzati', 'info')
       return
     }
     if (!confirm(`Analizzare ${pending.length} punti? Ci vorrà circa ${pending.length * 3} secondi.`))
@@ -319,11 +342,32 @@ export default function MapClient() {
         mapRef.current?.setView(newCenter, 16)
         setSidebarOpen(false)
       } else {
-        alert('Zona non trovata.')
+        showToast('Zona non trovata', 'error')
       }
     } catch {
-      alert('Errore di rete.')
+      showToast('Errore di rete nella ricerca', 'error')
     }
+  }
+
+  // Geolocalizzazione: bottone per centrare la mappa sulla posizione utente
+  function locateMe() {
+    if (!navigator.geolocation) {
+      showToast('Geolocalizzazione non supportata', 'error')
+      return
+    }
+    showToast('Rilevamento posizione…', 'info')
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const newCenter: [number, number] = [pos.coords.latitude, pos.coords.longitude]
+        setCenter(newCenter)
+        setLocationLabel(`📍 La mia posizione`)
+        mapRef.current?.setView(newCenter, 16)
+        setSidebarOpen(false)
+        showToast('Posizione rilevata', 'success')
+      },
+      () => showToast('Impossibile rilevare la posizione', 'error'),
+      { enableHighAccuracy: true, timeout: 10000 }
+    )
   }
 
   const stats = {
@@ -419,7 +463,7 @@ export default function MapClient() {
             <div className="text-[0.6rem] uppercase tracking-widest text-gray-400 mb-2 font-mono">
               🔍 Cerca zona
             </div>
-            <div className="flex gap-2">
+            <div className="flex gap-2 mb-2">
               <input
                 type="text"
                 value={zone}
@@ -435,6 +479,12 @@ export default function MapClient() {
                 Cerca
               </button>
             </div>
+            <button
+              onClick={locateMe}
+              className="w-full bg-white/10 border border-white/10 text-white py-2 rounded-lg font-mono text-xs hover:bg-white/20 transition"
+            >
+              📍 Usa la mia posizione
+            </button>
           </div>
 
           <div className="p-4 border-b border-white/10">
