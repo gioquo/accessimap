@@ -195,22 +195,25 @@ function buildStreetViewUrl(pano_id: string, heading: number, pitch: number, fov
   )
 }
 
-// Recupera immagini Street View con posizionamento ottimale per rilevare rampe.
+// Genera immagini Street View ottimizzate per vedere le rampe.
 //
-// STRATEGIA IN DUE LIVELLI:
+// Geometria corretta:
+//   roadBearing = direzione della strada (es. 90° = E-O)
+//   crossing direction = roadBearing ± 90° = direzione perpendicolare alla strada
+//   Le strisce corrono nella crossing direction
 //
-// LIVELLO A — Pano SUL crossing (dist < 6m):
-//   Guardare nella DIREZIONE DELLA STRADA (= perpendicolare alle strisce) garantisce:
-//   1. Nessuna auto può parcheggiare sulle strisce → visuale garantita libera
-//   2. Il cordolo LONTANO appare in prospettiva: rampa = salita graduale,
-//      gradino = faccia verticale brusca → AI può distinguerli
-//   Direzioni: roadBearing e roadBearing+180° (vede cordolo N e cordolo S)
-//   + ±90° per vista profilo laterale (conferma la pendenza)
+//   SHOT PRIMARI (crossing direction, rb+90° e rb+270°):
+//   = "dal centro delle strisce, prima da una parte poi dall'altra"
+//   = zona garantita car-free (auto non possono stare sulle strisce)
+//   = cordolo lontano visibile in prospettiva: salita graduale = rampa, muro = gradino
 //
-// LIVELLO B — Pano sulla STRADA (dist 6-35m):
-//   Pitch 0°: camera orizzontale, vede il profilo laterale del cordolo
-//   Heading verso il crossing: crossing è il punto di riferimento
-//   ±30° laterali: vede entrambi i lati della rampa
+//   SHOT SECONDARI (road direction, rb e rb+180°):
+//   = contesto della strada, visuale simile a quella del conducente
+//
+// STEP 1: Trova il pano più vicino al crossing (è il pano "sul crossing")
+//         e genera 4 shot da esso.
+// STEP 2: Cerca pano sulla strada (lungo road direction) per secondo angolo.
+// STEP 3: Fallback raggio largo se tutto fallisce.
 async function fetchStreetViewImages(
   targetLat: number,
   targetLng: number,
@@ -218,110 +221,68 @@ async function fetchStreetViewImages(
 ): Promise<AnalysisImage[]> {
   const images: AnalysisImage[] = []
   const seenPanos = new Set<string>()
+  const rb = ((roadBearing ?? 0) + 360) % 360  // normalizza, default 0° se non noto
 
-  // Punti di ricerca costruiti attorno alla direzione della strada.
-  // Raggio piccolo (7-9m) quando il bearing è noto: evita lo snap a strade laterali.
-  // Senza bearing: 8 direzioni con raggio standard.
-  const searchPoints: Array<{ lat: number; lng: number; radius: number; label: string }> = []
+  // ── STEP 1: pano principale (sul / vicino al crossing) ──
+  const mainPano = await getStreetViewPano(targetLat, targetLng, 22)
+  if (mainPano) {
+    seenPanos.add(mainPano.pano_id)
+    const dist = distanceMeters(mainPano.lat, mainPano.lng, targetLat, targetLng)
+    console.log(`[SV] main pano dist=${Math.round(dist)}m, pano=${mainPano.pano_id}`)
 
-  if (roadBearing !== null) {
-    const rb = roadBearing % 360
-    const rbo = (rb + 180) % 360
-
-    // Target diretto (pano sul crossing) — primo
-    searchPoints.push({ lat: targetLat, lng: targetLng, radius: 18, label: 'target' })
-
-    // 3 distanze lungo la strada in entrambi i sensi, raggio stretto = rimane sulla strada giusta
-    for (const dist of [8, 15, 24]) {
-      for (const b of [rb, rbo]) {
-        const p = offsetPoint(targetLat, targetLng, dist, b)
-        searchPoints.push({ lat: p.lat, lng: p.lng, radius: 8, label: `strada ${Math.round(b)}° a ${dist}m` })
-      }
-    }
-    // Perpendicolare alla strada (strade trasversali) — raggio leggermente più largo
-    for (const dist of [10, 18]) {
-      for (const b of [(rb + 90) % 360, (rb + 270) % 360]) {
-        const p = offsetPoint(targetLat, targetLng, dist, b)
-        searchPoints.push({ lat: p.lat, lng: p.lng, radius: 10, label: `trasversale ${Math.round(b)}° a ${dist}m` })
-      }
-    }
-  } else {
-    // Direzione sconosciuta: 8 direzioni standard
-    searchPoints.push({ lat: targetLat, lng: targetLng, radius: 18, label: 'target' })
-    for (const angle of [0, 45, 90, 135, 180, 225, 270, 315]) {
-      const p = offsetPoint(targetLat, targetLng, 12, angle)
-      searchPoints.push({ lat: p.lat, lng: p.lng, radius: 12, label: `${angle}° 12m` })
-    }
-    for (const angle of [0, 90, 180, 270]) {
-      const p = offsetPoint(targetLat, targetLng, 22, angle)
-      searchPoints.push({ lat: p.lat, lng: p.lng, radius: 14, label: `${angle}° 22m` })
-    }
-  }
-  searchPoints.push({ lat: targetLat, lng: targetLng, radius: 80, label: 'fallback' })
-
-  for (const sp of searchPoints) {
-    if (images.length >= 4) break
-
-    const pano = await getStreetViewPano(sp.lat, sp.lng, sp.radius)
-    if (!pano || seenPanos.has(pano.pano_id)) continue
-    seenPanos.add(pano.pano_id)
-
-    const dist = distanceMeters(pano.lat, pano.lng, targetLat, targetLng)
-
-    if (dist < 6) {
-      // ── LIVELLO A: pano SUL crossing ──
-      // Guarda nella direzione della strada (perp. alle strisce = area car-free)
-      // pitch -8°: vede il cordolo lontano in prospettiva — la salita è visibile
-      const rb = roadBearing ?? 0
-      const onCrossingShots = [
-        { h: rb % 360,              pitch: -8, fov: 75, label: 'direzione strada A → cordolo A in prospettiva' },
-        { h: (rb + 180) % 360,      pitch: -8, fov: 75, label: 'direzione strada B → cordolo B in prospettiva' },
-        { h: (rb + 90) % 360,       pitch:  0, fov: 70, label: 'profilo lato sx — vede pendenza' },
-        { h: (rb + 270) % 360,      pitch:  0, fov: 70, label: 'profilo lato dx — vede pendenza' },
-      ]
-      for (const { h, pitch, fov, label } of onCrossingShots) {
-        if (images.length >= 4) break
-        const url = buildStreetViewUrl(pano.pano_id, h, pitch, fov)
-        try {
-          const img = await imageToBase64(url)
-          images.push({ ...img, url, description: `Street View sul crossing → ${label}`, source: 'streetview' })
-        } catch (e) { console.log('[SV]', (e as Error).message) }
-      }
-      continue
-    }
-
-    // ── LIVELLO B: pano sulla strada ──
-    // Pitch 0°: visuale orizzontale, mostra profilo del cordolo
-    const heading = bearingTo(pano.lat, pano.lng, targetLat, targetLng)
-
-    // Se il road bearing è noto, usiamo anche gli heading allineati alla strada
-    // per garantire una visuale "lungo il crossing" anche se il pano è leggermente offset
-    const roadAligned = roadBearing !== null ? [
-      { h: roadBearing % 360,          fov: 90, label: `da ${Math.round(dist)}m, strada dir.A (FOV 90°)` },
-      { h: (roadBearing + 180) % 360,  fov: 90, label: `da ${Math.round(dist)}m, strada dir.B (FOV 90°)` },
-    ] : []
-
-    const towardTarget = [
-      { h: heading,              fov: 85, label: `frontale da ${Math.round(dist)}m` },
-      { h: (heading - 30 + 360) % 360, fov: 65, label: `lato sx da ${Math.round(dist)}m` },
-      { h: (heading + 30) % 360,       fov: 65, label: `lato dx da ${Math.round(dist)}m` },
+    // PRIMARI: crossing direction (rb+90° e rb+270°) = "da una parte e dall'altra"
+    // SECONDARI: road direction (rb e rb+180°) = contesto stradale
+    const shots = [
+      { h: (rb + 90) % 360,  pitch: -10, fov: 85, label: `crossing dir. A (verso cordolo), dist=${Math.round(dist)}m` },
+      { h: (rb + 270) % 360, pitch: -10, fov: 85, label: `crossing dir. B (verso cordolo opp.), dist=${Math.round(dist)}m` },
+      { h: rb,               pitch: -5,  fov: 90, label: `strada dir. A (contesto), dist=${Math.round(dist)}m` },
+      { h: (rb + 180) % 360, pitch: -5,  fov: 90, label: `strada dir. B (contesto opp.), dist=${Math.round(dist)}m` },
     ]
-
-    // Prima i road-aligned (più utili), poi verso target
-    const allCuts = images.length === 0
-      ? [...roadAligned, ...towardTarget]
-      : [{ h: heading, fov: 85, label: `da ${Math.round(dist)}m alt.` }]
-
-    for (const { h, fov, label } of allCuts) {
+    for (const { h, pitch, fov, label } of shots) {
       if (images.length >= 4) break
-      const url = buildStreetViewUrl(pano.pano_id, h, 0, fov)
+      const url = buildStreetViewUrl(mainPano.pano_id, h, pitch, fov)
       try {
         const img = await imageToBase64(url)
-        images.push({ ...img, url, description: `Street View ${label}, pitch 0°`, source: 'streetview' })
-      } catch (e) { console.log('[SV]', (e as Error).message) }
+        images.push({ ...img, url, description: `Street View ${label}`, source: 'streetview' })
+      } catch (e) { console.log('[SV] fetch err:', (e as Error).message) }
     }
   }
 
+  // ── STEP 2: pano secondario sulla strada (se disponibile) ──
+  // Cerca lungo la road direction per avere un secondo punto di vista
+  if (images.length < 4) {
+    for (const dist of [10, 18]) {
+      for (const b of [rb, (rb + 180) % 360]) {
+        if (images.length >= 4) break
+        const p = offsetPoint(targetLat, targetLng, dist, b)
+        const pano2 = await getStreetViewPano(p.lat, p.lng, 9)
+        if (!pano2 || seenPanos.has(pano2.pano_id)) continue
+        seenPanos.add(pano2.pano_id)
+        const d2 = distanceMeters(pano2.lat, pano2.lng, targetLat, targetLng)
+        const heading = bearingTo(pano2.lat, pano2.lng, targetLat, targetLng)
+        const url = buildStreetViewUrl(pano2.pano_id, heading, 0, 85)
+        try {
+          const img = await imageToBase64(url)
+          images.push({ ...img, url, description: `Street View da strada dist=${Math.round(d2)}m`, source: 'streetview' })
+        } catch (e) { console.log('[SV]', (e as Error).message) }
+      }
+    }
+  }
+
+  // ── STEP 3: fallback raggio largo ──
+  if (images.length === 0) {
+    const fallback = await getStreetViewPano(targetLat, targetLng, 80)
+    if (fallback && !seenPanos.has(fallback.pano_id)) {
+      const heading = bearingTo(fallback.lat, fallback.lng, targetLat, targetLng)
+      const url = buildStreetViewUrl(fallback.pano_id, heading, 0, 90)
+      try {
+        const img = await imageToBase64(url)
+        images.push({ ...img, url, description: 'Street View fallback raggio largo', source: 'streetview' })
+      } catch (e) { console.log('[SV fallback]', (e as Error).message) }
+    }
+  }
+
+  console.log(`[SV] total: ${images.length} images`)
   return images
 }
 
