@@ -541,157 +541,211 @@ export default function MapClient() {
       </div>
 
       {selected && (
-        <div className="fixed bottom-0 left-0 right-0 bg-neutral-900/95 backdrop-blur-xl border-t border-white/10 rounded-t-2xl p-4 pb-6 z-[150] max-h-[80vh] overflow-y-auto">
-          <div className="w-10 h-1 bg-white/20 rounded mx-auto mb-3" />
-          <button
+        <>
+          {/* Overlay tap-to-close su mobile */}
+          <div
             onClick={() => setSelected(null)}
-            className="absolute top-3 right-3 w-8 h-8 rounded-lg bg-white/10 border border-white/10 text-white text-sm"
-          >
-            ✕
-          </button>
-          <div className="font-bold mb-1 pr-10 text-white">
-            {selected.name || `Punto #${selected.id}`}
-          </div>
-          <div className="text-xs text-gray-400 font-mono mb-3">
-            {selected.lat.toFixed(6)}, {selected.lng.toFixed(6)}
-          </div>
+            className="fixed inset-0 bg-black/50 z-[140] lg:hidden"
+          />
 
-          <div className="w-full bg-black border border-white/10 rounded-xl overflow-hidden mb-3">
-            {imageUrl ? (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img src={imageUrl} alt="Vista stradale" className="w-full max-h-72 object-contain bg-black" />
-            ) : (
-              <div className="h-44 flex items-center justify-center text-center text-gray-400 text-xs font-mono p-4">
-                📷
-                <br />
-                Premi Analizza per caricare
-              </div>
-            )}
-            {imageUrls.length > 1 && (
-              <div className="flex gap-1.5 p-2 overflow-x-auto bg-black/50">
-                {imageUrls.map((url, i) => (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img
-                    key={i}
-                    src={url}
-                    onClick={() => setImageUrl(url)}
-                    className={`h-14 w-14 object-contain bg-black rounded cursor-pointer flex-shrink-0 border transition ${
-                      imageUrl === url
-                        ? 'border-emerald-400 opacity-100'
-                        : 'border-white/20 opacity-50 hover:opacity-100'
-                    }`}
-                    alt={`Vista ${i + 1}`}
-                  />
-                ))}
-              </div>
-            )}
-          </div>
+          {/* Pannello principale */}
+          <div className="fixed top-14 right-0 bottom-0 w-full lg:w-[740px] bg-neutral-950 border-l border-white/10 z-[150] flex flex-col">
 
-          <div className="flex gap-2 mb-3">
-            <a
-              href={`https://www.google.com/maps?q=&layer=c&cbll=${selected.lat},${selected.lng}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="flex-1 flex items-center justify-center gap-1.5 bg-blue-500/10 border border-blue-500/30 text-blue-400 py-2 rounded-lg text-sm font-mono hover:bg-blue-500/20 transition"
-            >
-              🗺 Street View
-            </a>
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              className="flex-1 flex items-center justify-center gap-1.5 bg-violet-500/10 border border-violet-500/30 text-violet-400 py-2 rounded-lg text-sm font-mono hover:bg-violet-500/20 transition"
-            >
-              📸 Carica screenshot
-            </button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="image/*"
-              className="hidden"
-              onChange={handleScreenshotUpload}
-            />
-          </div>
-          {customImages.length > 0 && (
-            <div className="flex items-center gap-2 mb-2 flex-wrap">
-              <span className="text-[0.6rem] uppercase tracking-widest text-violet-400 font-mono">
-                📸 Screenshot ({customImages.length}):
-              </span>
-              {customImages.map((img, i) => (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img
-                  key={i}
-                  src={img.previewUrl}
-                  onClick={() => setImageUrl(img.previewUrl)}
-                  className={`h-12 w-12 object-contain bg-black rounded cursor-pointer border transition ${
-                    imageUrl === img.previewUrl ? 'border-violet-400' : 'border-violet-500/30 opacity-60 hover:opacity-100'
-                  }`}
-                  alt={`Screenshot ${i + 1}`}
-                />
-              ))}
+            {/* ── Header ── */}
+            <div className="flex items-center gap-3 px-4 py-3 border-b border-white/10 shrink-0">
+              <div className="flex-1 min-w-0">
+                <div className="font-bold text-white text-sm truncate">
+                  {selected.name || `Punto #${selected.id}`}
+                </div>
+                <div className="text-[0.65rem] text-gray-400 font-mono">
+                  {selected.lat.toFixed(6)}, {selected.lng.toFixed(6)}
+                </div>
+              </div>
+              {(() => {
+                const sb = statusLabel(selected.status)
+                return (
+                  <span className={`text-[0.65rem] font-mono px-2.5 py-1 rounded-full border shrink-0 ${sb.cls}`}>
+                    {sb.label}
+                  </span>
+                )
+              })()}
               <button
-                onClick={() => setCustomImages([])}
-                className="text-[0.6rem] text-rose-400 font-mono hover:text-rose-300"
+                onClick={() => setSelected(null)}
+                className="w-8 h-8 rounded-lg bg-white/10 border border-white/10 text-white text-sm shrink-0 flex items-center justify-center"
               >
-                ✕ rimuovi
+                ✕
               </button>
             </div>
-          )}
 
-          {analysis && (
-            <div className="bg-white/5 border border-white/10 rounded-lg p-3 mb-3 text-sm text-white leading-relaxed">
-              <div className="text-[0.6rem] uppercase tracking-widest text-emerald-400 mb-1.5 font-mono">
-                🤖 Analisi AI
+            {/* ── Body: colonna immagini + colonna info ── */}
+            <div className="flex-1 min-h-0 flex flex-col lg:flex-row">
+
+              {/* COLONNA SINISTRA — Immagini */}
+              <div className="lg:w-[360px] lg:shrink-0 flex flex-col bg-black border-b lg:border-b-0 lg:border-r border-white/10 h-64 lg:h-auto">
+
+                {/* Immagine principale — occupa tutto lo spazio disponibile */}
+                <div className="flex-1 min-h-0 flex items-center justify-center p-2">
+                  {imageUrl ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      src={imageUrl}
+                      alt="Vista stradale"
+                      className="max-w-full max-h-full object-contain"
+                    />
+                  ) : (
+                    <div className="text-center text-gray-500 text-xs font-mono">
+                      📷<br />Premi Analizza per caricare
+                    </div>
+                  )}
+                </div>
+
+                {/* Striscia thumbnail (Street View + screenshot custom) */}
+                {(imageUrls.length > 1 || customImages.length > 0) && (
+                  <div className="shrink-0 flex gap-1.5 p-2 overflow-x-auto border-t border-white/10 bg-neutral-900/80">
+                    {imageUrls.map((url, i) => (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img
+                        key={i}
+                        src={url}
+                        onClick={() => setImageUrl(url)}
+                        className={`h-12 w-12 object-contain bg-black rounded cursor-pointer flex-shrink-0 border transition ${
+                          imageUrl === url ? 'border-emerald-400 opacity-100' : 'border-white/20 opacity-50 hover:opacity-100'
+                        }`}
+                        alt={`Vista ${i + 1}`}
+                      />
+                    ))}
+                    {customImages.map((img, i) => (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img
+                        key={`c${i}`}
+                        src={img.previewUrl}
+                        onClick={() => setImageUrl(img.previewUrl)}
+                        className={`h-12 w-12 object-contain bg-black rounded cursor-pointer flex-shrink-0 border transition ${
+                          imageUrl === img.previewUrl ? 'border-violet-400 opacity-100' : 'border-violet-500/40 opacity-50 hover:opacity-100'
+                        }`}
+                        alt={`Screenshot ${i + 1}`}
+                      />
+                    ))}
+                  </div>
+                )}
               </div>
-              <div
-                dangerouslySetInnerHTML={{
-                  __html: analysis
-                    .replace(/&/g, '&amp;')
-                    .replace(/</g, '&lt;')
-                    .replace(/>/g, '&gt;')
-                    .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-                    .replace(/\n/g, '<br>'),
-                }}
-              />
+
+              {/* COLONNA DESTRA — Analisi + controlli */}
+              <div className="flex-1 min-h-0 flex flex-col overflow-y-auto">
+
+                {/* Analisi AI — scrollabile, prende tutto lo spazio disponibile */}
+                <div className="flex-1 p-4 overflow-y-auto">
+                  {analysis ? (
+                    <div className="text-sm text-white leading-relaxed">
+                      <div className="text-[0.6rem] uppercase tracking-widest text-emerald-400 mb-2 font-mono">
+                        🤖 Analisi AI
+                      </div>
+                      <div
+                        dangerouslySetInnerHTML={{
+                          __html: analysis
+                            .replace(/&/g, '&amp;')
+                            .replace(/</g, '&lt;')
+                            .replace(/>/g, '&gt;')
+                            .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+                            .replace(/\n/g, '<br>'),
+                        }}
+                      />
+                    </div>
+                  ) : (
+                    <div className="text-gray-500 text-xs font-mono text-center mt-8">
+                      Nessuna analisi disponibile.<br />Premi il pulsante in basso.
+                    </div>
+                  )}
+                </div>
+
+                {/* Area controlli — fissa in fondo alla colonna */}
+                <div className="shrink-0 border-t border-white/10 p-4 flex flex-col gap-2.5">
+
+                  {/* Badge screenshot caricati */}
+                  {customImages.length > 0 && (
+                    <div className="flex items-center justify-between text-xs font-mono bg-violet-500/10 border border-violet-500/20 rounded-lg px-3 py-1.5">
+                      <span className="text-violet-400">📸 {customImages.length} screenshot inclusi</span>
+                      <button
+                        onClick={() => setCustomImages([])}
+                        className="text-rose-400 hover:text-rose-300 transition"
+                      >
+                        ✕ rimuovi
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Override manuale */}
+                  <div>
+                    <div className="text-[0.6rem] uppercase tracking-widest text-gray-400 font-mono mb-1.5">
+                      Correggi manualmente
+                    </div>
+                    <div className="flex gap-1.5">
+                      {(
+                        [
+                          { verdict: 'ok' as CrossingStatus, emoji: '🟢', label: 'Rampa sì', cls: 'border-emerald-500/50 text-emerald-400 hover:bg-emerald-500/20' },
+                          { verdict: 'partial' as CrossingStatus, emoji: '🟡', label: 'Parziale', cls: 'border-amber-500/50 text-amber-400 hover:bg-amber-500/20' },
+                          { verdict: 'bad' as CrossingStatus, emoji: '🔴', label: 'Nessuna', cls: 'border-rose-500/50 text-rose-400 hover:bg-rose-500/20' },
+                          { verdict: 'unknown' as CrossingStatus, emoji: '⚪', label: 'N/D', cls: 'border-white/20 text-gray-400 hover:bg-white/10' },
+                        ] as const
+                      ).map(({ verdict, emoji, label, cls }) => (
+                        <button
+                          key={verdict}
+                          onClick={() => manualOverride(verdict)}
+                          className={`flex-1 border rounded-lg py-1.5 text-[0.65rem] font-mono transition flex flex-col items-center gap-0.5 ${cls} ${
+                            selected.status === verdict ? 'ring-1 ring-white/30 bg-white/5' : ''
+                          }`}
+                        >
+                          <span className="text-base leading-none">{emoji}</span>
+                          <span>{label}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Pulsanti azione */}
+                  <div className="flex gap-2">
+                    <a
+                      href={`https://www.google.com/maps?q=&layer=c&cbll=${selected.lat},${selected.lng}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="flex-1 flex items-center justify-center gap-1 bg-blue-500/10 border border-blue-500/30 text-blue-400 py-2 rounded-lg text-xs font-mono hover:bg-blue-500/20 transition"
+                    >
+                      🗺 Street View
+                    </a>
+                    <button
+                      onClick={() => fileInputRef.current?.click()}
+                      className="flex-1 flex items-center justify-center gap-1 bg-violet-500/10 border border-violet-500/30 text-violet-400 py-2 rounded-lg text-xs font-mono hover:bg-violet-500/20 transition"
+                    >
+                      📸 Screenshot
+                    </button>
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept="image/*"
+                      className="hidden"
+                      onChange={handleScreenshotUpload}
+                    />
+                  </div>
+
+                  <button
+                    onClick={() => analyzeSelected(!!analysis)}
+                    disabled={analyzing}
+                    className="w-full bg-emerald-400 text-black py-3 rounded-lg font-bold text-sm disabled:opacity-50"
+                  >
+                    {analyzing
+                      ? '⏳ Analisi in corso…'
+                      : customImages.length > 0
+                      ? `🤖 Analizza con AI (+${customImages.length} screenshot)`
+                      : analysis
+                      ? '🔄 Rianalizza'
+                      : '🤖 Analizza con AI'}
+                  </button>
+
+                </div>
+              </div>
             </div>
-          )}
-
-          <div className="flex gap-2 mb-3 items-center">
-            <span className="text-[0.6rem] uppercase tracking-widest text-gray-400 font-mono whitespace-nowrap">
-              Override manuale:
-            </span>
-            {(
-              [
-                { verdict: 'ok' as CrossingStatus, emoji: '🟢', label: 'Sì', cls: 'border-emerald-500/50 text-emerald-400 hover:bg-emerald-500/20' },
-                { verdict: 'partial' as CrossingStatus, emoji: '🟡', label: 'Parz.', cls: 'border-amber-500/50 text-amber-400 hover:bg-amber-500/20' },
-                { verdict: 'bad' as CrossingStatus, emoji: '🔴', label: 'No', cls: 'border-rose-500/50 text-rose-400 hover:bg-rose-500/20' },
-                { verdict: 'unknown' as CrossingStatus, emoji: '⚪', label: 'N/D', cls: 'border-white/20 text-gray-400 hover:bg-white/10' },
-              ] as const
-            ).map(({ verdict, emoji, label, cls }) => (
-              <button
-                key={verdict}
-                onClick={() => manualOverride(verdict)}
-                className={`flex-1 border rounded-lg py-1.5 text-xs font-mono transition ${cls} ${
-                  selected.status === verdict ? 'ring-1 ring-white/30 bg-white/5' : ''
-                }`}
-              >
-                {emoji} {label}
-              </button>
-            ))}
           </div>
-
-          <button
-            onClick={() => analyzeSelected(!!analysis)}
-            disabled={analyzing}
-            className="w-full bg-emerald-400 text-black py-3 rounded-lg font-bold disabled:opacity-50"
-          >
-            {analyzing
-              ? '⏳ Analisi in corso…'
-              : customImages.length > 0
-              ? `🤖 Analizza con AI (+${customImages.length} screenshot)`
-              : analysis
-              ? '🔄 Rianalizza'
-              : '🤖 Analizza con AI'}
-          </button>
-        </div>
+        </>
       )}
     </>
   )
