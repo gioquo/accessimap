@@ -92,7 +92,7 @@ async function getStreetViewPano(lat: number, lng: number, radius: number): Prom
   }
 }
 
-// Usa pano_id invece di location: garantisce il panorama esatto trovato dal metadata
+// Usa pano_id: garantisce il panorama esatto trovato dal metadata, senza re-snap
 function buildStreetViewUrl(
   pano_id: string,
   heading: number,
@@ -108,31 +108,37 @@ function buildStreetViewUrl(
   )
 }
 
-// Genera fino a 6 immagini Street View per un attraversamento.
+// Pitch fisicamente corretto: punta esattamente al livello del suolo alla distanza del target.
+// Street View camera è a ~1.4m d'altezza: arctan(1.4 / dist) gradi verso il basso.
+// Esempio: dist=10m → -8°, dist=20m → -4°, dist=5m → -16°.
+// Valori precedenti (-15° a 20m) puntavano al suolo a 5m → vedevano l'asfalto, non il cordolo.
+function pitchForDistance(dist: number): number {
+  return -Math.round(Math.atan2(1.4, Math.max(dist, 3)) * 180 / Math.PI)
+}
+
+// Genera fino a 6 immagini Street View ottimizzate per vedere le rampe/cordoli.
 //
-// Caso pano ≈ target (dist < 8m): il bearing verso il target è inaffidabile (rumore su distanze
-// minime), quindi si usano le 4 direzioni cardinali assolute — almeno 2 saranno perpendicolari
-// alla strada e mostreranno il cordolo.
-//
-// Caso pano lontano: heading calcolato dal pano al target + variazioni ±35° per catturare
-// entrambi i lati dell'attraversamento. Mix di pitch: un colpo inclinato in basso per il
-// dettaglio del cordolo + colpi orizzontali (pitch 0°) per il contesto.
+// Strategia:
+// - Cerca panorami dal target verso l'esterno (non il contrario): trova pani sulla STRADA
+//   che guardano verso il marciapiede — questa è la visuale "pedone che si avvicina al crossing"
+// - Pitch fisico (arctan formula): punta esattamente al livello del suolo alla distanza del target,
+//   così si vede il cordolo/rampa in primo piano, non l'asfalto davanti
+// - FOV=80° per il colpo principale: cattura entrambi i lati del marciapiede in un'unica immagine
+// - Pano sul crossing (dist<8m): 4 cardinali orizzontali — almeno 2 saranno parallele al marciapiede
 async function generateShots(targetLat: number, targetLng: number): Promise<StreetViewShot[]> {
   const shots: StreetViewShot[] = []
   const seenPanos = new Set<string>()
 
-  // Punti di ricerca: target diretto → 4 cardinali a 15m → 4 cardinali a 30m → fallback 80m
-  const searchPoints: Array<{ lat: number; lng: number; radius: number }> = [
-    { lat: targetLat, lng: targetLng, radius: 25 },
-  ]
+  // Priorità: punti a 15m e 25m nelle 4 direzioni (trovano pani sulla strada)
+  // poi target diretto come fallback, infine raggio largo
+  const searchPoints: Array<{ lat: number; lng: number; radius: number }> = []
   for (const angle of [0, 90, 180, 270]) {
-    const p = offsetPoint(targetLat, targetLng, 15, angle)
-    searchPoints.push({ lat: p.lat, lng: p.lng, radius: 20 })
+    const p15 = offsetPoint(targetLat, targetLng, 15, angle)
+    const p25 = offsetPoint(targetLat, targetLng, 25, angle)
+    searchPoints.push({ lat: p15.lat, lng: p15.lng, radius: 15 })
+    searchPoints.push({ lat: p25.lat, lng: p25.lng, radius: 18 })
   }
-  for (const angle of [0, 90, 180, 270]) {
-    const p = offsetPoint(targetLat, targetLng, 30, angle)
-    searchPoints.push({ lat: p.lat, lng: p.lng, radius: 20 })
-  }
+  searchPoints.push({ lat: targetLat, lng: targetLng, radius: 20 })
   searchPoints.push({ lat: targetLat, lng: targetLng, radius: 80 })
 
   for (const sp of searchPoints) {
@@ -143,9 +149,11 @@ async function generateShots(targetLat: number, targetLng: number): Promise<Stre
     seenPanos.add(pano.pano_id)
 
     const dist = distanceMeters(pano.lat, pano.lng, targetLat, targetLng)
+    const pitch = pitchForDistance(dist)
 
-    // Pano quasi sul crossing: heading verso target inaffidabile → 4 cardinali assolute
     if (dist < 8) {
+      // Pano sul crossing: heading inaffidabile → 4 cardinali a pitch orizzontale
+      // Almeno 2 direzioni saranno parallele al marciapiede
       const cardinals = [
         { h: 0, label: 'Nord' }, { h: 90, label: 'Est' },
         { h: 180, label: 'Sud' }, { h: 270, label: 'Ovest' },
@@ -153,42 +161,42 @@ async function generateShots(targetLat: number, targetLng: number): Promise<Stre
       for (const { h, label } of cardinals) {
         if (shots.length >= 6) break
         shots.push({
-          url: buildStreetViewUrl(pano.pano_id, h, -8),
+          url: buildStreetViewUrl(pano.pano_id, h, -3, 80),
           pano_id: pano.pano_id,
           observer_lat: pano.lat,
           observer_lng: pano.lng,
           heading: h,
           distFromTarget: Math.round(dist),
-          description: `Vista ${label} (pano sul crossing, pitch -8°)`,
+          description: `Sul crossing, verso ${label}, pitch -3°, FOV 80°`,
         })
       }
       continue
     }
 
-    // Pano lontano: heading verso target + variazioni ±35°
-    // Mix pitch: centro inclinato (vede cordolo) + lati orizzontali (contesto)
+    // Pano sulla strada: heading verso target con pitch fisico
+    // Colpo principale FOV=80° (vede entrambi i lati del marciapiede)
+    // Colpi laterali ±40° FOV=65° per i dettagli dei singoli lati della rampa
     const headingCenter = bearingTo(pano.lat, pano.lng, targetLat, targetLng)
-    const pitchCenter = dist < 25 ? -18 : dist < 45 ? -12 : -8
 
-    const panoCuts: Array<{ headingOffset: number; pitch: number; label: string }> =
+    const panoCuts: Array<{ headingOffset: number; pitch: number; fov: number; label: string }> =
       seenPanos.size === 1
         ? [
-            { headingOffset: 0, pitch: pitchCenter, label: 'centro (inclinato)' },
-            { headingOffset: -35, pitch: 0, label: 'sinistra (orizzontale)' },
-            { headingOffset: 35, pitch: 0, label: 'destra (orizzontale)' },
+            { headingOffset: 0,   pitch,     fov: 80, label: 'principale (FOV largo)' },
+            { headingOffset: -40, pitch: -3, fov: 65, label: 'lato sinistro rampa' },
+            { headingOffset: 40,  pitch: -3, fov: 65, label: 'lato destro rampa' },
           ]
         : shots.length < 4
         ? [
-            { headingOffset: 0, pitch: pitchCenter, label: 'centro' },
-            { headingOffset: -30, pitch: 0, label: 'lato' },
+            { headingOffset: 0,   pitch,     fov: 80, label: 'principale' },
+            { headingOffset: -35, pitch: -3, fov: 65, label: 'lato' },
           ]
-        : [{ headingOffset: 0, pitch: pitchCenter, label: 'centro' }]
+        : [{ headingOffset: 0, pitch, fov: 75, label: 'principale' }]
 
     for (const cut of panoCuts) {
       if (shots.length >= 6) break
       const h = (headingCenter + cut.headingOffset + 360) % 360
       shots.push({
-        url: buildStreetViewUrl(pano.pano_id, h, cut.pitch),
+        url: buildStreetViewUrl(pano.pano_id, h, cut.pitch, cut.fov),
         pano_id: pano.pano_id,
         observer_lat: pano.lat,
         observer_lng: pano.lng,
