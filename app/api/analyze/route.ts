@@ -195,17 +195,22 @@ function buildStreetViewUrl(pano_id: string, heading: number, pitch: number, fov
   )
 }
 
-// Recupera immagini Street View con posizionamento guidato dalla direzione stradale.
+// Recupera immagini Street View con posizionamento ottimale per rilevare rampe.
 //
-// Se roadBearing è disponibile (dalla query OSM):
-//   → Cerca pani ESATTAMENTE sulla strada (offset nel senso della strada)
-//   → Guarda PERPENDICOLARMENTE alla strada (verso le rampe ai lati del crossing)
-//   → Questo è il modo corretto: stai sulla strada e guardi verso il marciapiede
+// STRATEGIA IN DUE LIVELLI:
 //
-// Se roadBearing non disponibile: fallback a 8 direzioni ogni 45°
+// LIVELLO A — Pano SUL crossing (dist < 6m):
+//   Guardare nella DIREZIONE DELLA STRADA (= perpendicolare alle strisce) garantisce:
+//   1. Nessuna auto può parcheggiare sulle strisce → visuale garantita libera
+//   2. Il cordolo LONTANO appare in prospettiva: rampa = salita graduale,
+//      gradino = faccia verticale brusca → AI può distinguerli
+//   Direzioni: roadBearing e roadBearing+180° (vede cordolo N e cordolo S)
+//   + ±90° per vista profilo laterale (conferma la pendenza)
 //
-// Pitch 0° sempre: mostra il PROFILO del cordolo (gradino vs rampa),
-// non la superficie dall'alto che confonde l'AI.
+// LIVELLO B — Pano sulla STRADA (dist 6-35m):
+//   Pitch 0°: camera orizzontale, vede il profilo laterale del cordolo
+//   Heading verso il crossing: crossing è il punto di riferimento
+//   ±30° laterali: vede entrambi i lati della rampa
 async function fetchStreetViewImages(
   targetLat: number,
   targetLng: number,
@@ -214,41 +219,23 @@ async function fetchStreetViewImages(
   const images: AnalysisImage[] = []
   const seenPanos = new Set<string>()
 
-  const searchPoints: Array<{ lat: number; lng: number; radius: number; label: string }> = []
+  // Punti di ricerca: prima il target (trova pano sul crossing),
+  // poi i punti sulla strada nella direzione del bearing
+  const searchPoints: Array<{ lat: number; lng: number; radius: number; label: string }> = [
+    { lat: targetLat, lng: targetLng, radius: 20, label: 'sul crossing' },
+  ]
 
-  if (roadBearing !== null) {
-    // Conosciamo la direzione della strada → posizionamento preciso
-    // La strada va a roadBearing → le rampe sono ai lati (bearing ±90°)
-    // I panorami utili sono SULLA STRADA, davanti e dietro al crossing
-    const roadDir = roadBearing % 180 // normalizza 0-180
-    const perpDir = (roadDir + 90) % 360
+  const dirs = roadBearing !== null
+    ? [roadBearing, (roadBearing + 180) % 360, (roadBearing + 90) % 360, (roadBearing + 270) % 360]
+    : [0, 90, 180, 270, 45, 135, 225, 315]
 
-    // 2 posizioni sulla strada (davanti e dietro) × 2 distanze
-    for (const dist of [12, 20]) {
-      for (const b of [roadDir, (roadDir + 180) % 360]) {
-        const p = offsetPoint(targetLat, targetLng, dist, b)
-        searchPoints.push({ lat: p.lat, lng: p.lng, radius: 14, label: `sulla strada ${b.toFixed(0)}° a ${dist}m` })
-      }
-    }
-    // 2 posizioni perpendicolari (per crossings su strade oblique)
-    for (const dist of [12, 20]) {
-      for (const b of [perpDir, (perpDir + 180) % 360]) {
-        const p = offsetPoint(targetLat, targetLng, dist, b)
-        searchPoints.push({ lat: p.lat, lng: p.lng, radius: 14, label: `perp. ${b.toFixed(0)}° a ${dist}m` })
-      }
-    }
-  } else {
-    // Direzione sconosciuta: 8 direzioni ogni 45° per coprire tutti i casi
-    for (const angle of [0, 45, 90, 135, 180, 225, 270, 315]) {
-      const p = offsetPoint(targetLat, targetLng, 12, angle)
-      searchPoints.push({ lat: p.lat, lng: p.lng, radius: 12, label: `${angle}° a 12m` })
-    }
-    for (const angle of [0, 90, 180, 270]) {
-      const p = offsetPoint(targetLat, targetLng, 22, angle)
-      searchPoints.push({ lat: p.lat, lng: p.lng, radius: 15, label: `${angle}° a 22m` })
+  for (const dist of [12, 22]) {
+    for (const b of dirs) {
+      const p = offsetPoint(targetLat, targetLng, dist, b)
+      searchPoints.push({ lat: p.lat, lng: p.lng, radius: 14, label: `${Math.round(b)}° ${dist}m` })
     }
   }
-  searchPoints.push({ lat: targetLat, lng: targetLng, radius: 80, label: 'fallback raggio largo' })
+  searchPoints.push({ lat: targetLat, lng: targetLng, radius: 80, label: 'fallback' })
 
   for (const sp of searchPoints) {
     if (images.length >= 4) break
@@ -258,26 +245,47 @@ async function fetchStreetViewImages(
     seenPanos.add(pano.pano_id)
 
     const dist = distanceMeters(pano.lat, pano.lng, targetLat, targetLng)
-    const heading = bearingTo(pano.lat, pano.lng, targetLat, targetLng)
-    const pitch = dist < 5 ? -10 : 0  // sempre quasi orizzontale: mostra profilo cordolo
 
-    // Primo pano trovato: 3 shot (frontale + sx + dx) per vedere entrambe le rampe
-    // Pani successivi: 1 shot frontale per secondo punto di vista
+    if (dist < 6) {
+      // ── LIVELLO A: pano SUL crossing ──
+      // Guarda nella direzione della strada (perp. alle strisce = area car-free)
+      // pitch -8°: vede il cordolo lontano in prospettiva — la salita è visibile
+      const rb = roadBearing ?? 0
+      const onCrossingShots = [
+        { h: rb % 360,              pitch: -8, fov: 75, label: 'direzione strada A → cordolo A in prospettiva' },
+        { h: (rb + 180) % 360,      pitch: -8, fov: 75, label: 'direzione strada B → cordolo B in prospettiva' },
+        { h: (rb + 90) % 360,       pitch:  0, fov: 70, label: 'profilo lato sx — vede pendenza' },
+        { h: (rb + 270) % 360,      pitch:  0, fov: 70, label: 'profilo lato dx — vede pendenza' },
+      ]
+      for (const { h, pitch, fov, label } of onCrossingShots) {
+        if (images.length >= 4) break
+        const url = buildStreetViewUrl(pano.pano_id, h, pitch, fov)
+        try {
+          const img = await imageToBase64(url)
+          images.push({ ...img, url, description: `Street View sul crossing → ${label}`, source: 'streetview' })
+        } catch (e) { console.log('[SV]', (e as Error).message) }
+      }
+      continue
+    }
+
+    // ── LIVELLO B: pano sulla strada ──
+    // Pitch 0°: visuale orizzontale, mostra il profilo laterale del cordolo
+    const heading = bearingTo(pano.lat, pano.lng, targetLat, targetLng)
     const cuts = images.length === 0
       ? [
-          { ho: 0,   fov: 80, label: `frontale da ${Math.round(dist)}m — profilo cordolo` },
-          { ho: -35, fov: 65, label: `lato sx da ${Math.round(dist)}m — rampa sinistra` },
-          { ho: 35,  fov: 65, label: `lato dx da ${Math.round(dist)}m — rampa destra` },
+          { ho: 0,   fov: 80, label: `frontale da ${Math.round(dist)}m` },
+          { ho: -30, fov: 65, label: `lato sx da ${Math.round(dist)}m` },
+          { ho: 30,  fov: 65, label: `lato dx da ${Math.round(dist)}m` },
         ]
-      : [{ ho: 0, fov: 80, label: `da ${Math.round(dist)}m — angolo alternativo` }]
+      : [{ ho: 0, fov: 80, label: `da ${Math.round(dist)}m angolo alt.` }]
 
     for (const { ho, fov, label } of cuts) {
       if (images.length >= 4) break
       const h = (heading + ho + 360) % 360
-      const url = buildStreetViewUrl(pano.pano_id, h, pitch, fov)
+      const url = buildStreetViewUrl(pano.pano_id, h, 0, fov)
       try {
         const img = await imageToBase64(url)
-        images.push({ ...img, url, description: `Street View ${label}, pitch ${pitch}°`, source: 'streetview' })
+        images.push({ ...img, url, description: `Street View ${label}, pitch 0°`, source: 'streetview' })
       } catch (e) { console.log('[SV]', (e as Error).message) }
     }
   }
@@ -350,7 +358,7 @@ async function callGemini(prompt: string, images: Array<{ data: string; mimeType
   }
   const body = JSON.stringify({
     contents: [{ parts }],
-    generationConfig: { temperature: 0.1, maxOutputTokens: 2000 },
+    generationConfig: { temperature: 0.1, maxOutputTokens: 4000 },
   })
 
   let lastError: any = null
@@ -484,14 +492,16 @@ ${satCount > 0 ? `🛰️ SATELLITARI (prime ${satCount} immagini) — vista dal
   • Bordo rettilineo continuo senza interruzioni = nessuna rampa (gradino verticale)
   • Attenzione: angoli arrotondati del selciato NON sono rampe accessibili
 
-` : ''}🏙️ STREET VIEW (pitch ≈ 0°, vista quasi orizzontale da road level):
-  • Le immagini sono scattate dalla STRADA guardando verso il marciapiede
-  • Con pitch quasi orizzontale vedi il PROFILO LATERALE del cordolo:
-    - Gradino verticale (5-20 cm) = nessuna rampa → 🔴
-    - Superficie che sale gradualmente dal piano strada = rampa → 🟢
-    - Superficie parzialmente abbassata o un solo lato = parziale → 🟡
-  • NON confondere: curve del selciato, bordure, angoli smussati con rampe praticabili
-  • NON confondere: accessi a garage/cancelli privati con rampe pedonali pubbliche
+` : ''}🏙️ STREET VIEW — come leggere la prospettiva:
+  • Alcune immagini sono scattate SUL crossing guardando LUNGO la strada
+    (le strisce corrono ai lati, il cordolo lontano è in fondo all'inquadratura)
+  • In questa prospettiva: se c'è una RAMPA vedi il piano stradale che sale
+    gradualmente verso il livello del marciapiede nel punto lontano.
+    Se c'è un GRADINO vedi una transizione brusca verticale in fondo.
+  • Altre immagini guardano di LATO al cordolo: vedi direttamente la faccia
+    verticale (gradino) o la superficie inclinata (rampa).
+  • Auto sulla strada NON invalidano la valutazione se il cordolo è visibile
+    oltre o tra di esse. Le auto NON possono essere sulle strisce pedonali.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 DEFINIZIONI — COSA COSTITUISCE UNA RAMPA
