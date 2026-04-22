@@ -230,13 +230,11 @@ async function fetchStreetViewImages(
     const dist = distanceMeters(mainPano.lat, mainPano.lng, targetLat, targetLng)
     console.log(`[SV] main pano dist=${Math.round(dist)}m, pano=${mainPano.pano_id}`)
 
-    // PRIMARI: crossing direction (rb+90° e rb+270°) = "da una parte e dall'altra"
-    // SECONDARI: road direction (rb e rb+180°) = contesto stradale
+    // Solo crossing direction: "da una parte e dall'altra delle strisce"
+    // Road direction shots rimossi — erano inutili (mostravano la strada, non il cordolo)
     const shots = [
-      { h: (rb + 90) % 360,  pitch: -10, fov: 85, label: `crossing dir. A (verso cordolo), dist=${Math.round(dist)}m` },
-      { h: (rb + 270) % 360, pitch: -10, fov: 85, label: `crossing dir. B (verso cordolo opp.), dist=${Math.round(dist)}m` },
-      { h: rb,               pitch: -5,  fov: 90, label: `strada dir. A (contesto), dist=${Math.round(dist)}m` },
-      { h: (rb + 180) % 360, pitch: -5,  fov: 90, label: `strada dir. B (contesto opp.), dist=${Math.round(dist)}m` },
+      { h: (rb + 90) % 360,  pitch: -10, fov: 85, label: `crossing dir. A (verso cordolo A), dist=${Math.round(dist)}m` },
+      { h: (rb + 270) % 360, pitch: -10, fov: 85, label: `crossing dir. B (verso cordolo B), dist=${Math.round(dist)}m` },
     ]
     for (const { h, pitch, fov, label } of shots) {
       if (images.length >= 4) break
@@ -287,7 +285,40 @@ async function fetchStreetViewImages(
 }
 
 // ════════════════════════════════════════════════════
-// 3. MAPILLARY (immagini pedoni/ciclisti)
+// 3. KARTAVIEW (ex OpenStreetCam) — GRATUITO, nessun token
+// Community open source, spesso scattato a piedi o in bici.
+// API pubblica, nessuna API key richiesta.
+// ════════════════════════════════════════════════════
+
+async function fetchKartaViewImages(lat: number, lng: number): Promise<AnalysisImage[]> {
+  try {
+    const url = `https://api.kartaview.org/2.0/photo/list/?lat=${lat}&lng=${lng}&radius=60&ipp=5`
+    const res = await fetch(url, { headers: { 'Accept': 'application/json' } })
+    if (!res.ok) return []
+    const data = await res.json()
+    const photos = (data.result?.data || [])
+      .filter((p: any) => p.thumb_name || p.name)
+      .slice(0, 2)
+    const images: AnalysisImage[] = []
+    for (const photo of photos) {
+      const imgUrl = photo.thumb_name
+        ? `https://kartaview.org${photo.thumb_name}`
+        : `https://kartaview.org${photo.name}`
+      try {
+        const img = await imageToBase64(imgUrl)
+        images.push({ ...img, url: imgUrl, description: 'KartaView (community, a piedi/bici)', source: 'mapillary' as const })
+      } catch {}
+    }
+    if (images.length > 0) console.log(`[KartaView] ${images.length} images`)
+    return images
+  } catch (e) {
+    console.log('[KartaView] err:', (e as Error).message)
+    return []
+  }
+}
+
+// ════════════════════════════════════════════════════
+// 4. MAPILLARY (immagini pedoni/ciclisti)
 // Spesso scattate a livello del marciapiede — angolazione ideale per vedere
 // le rampe. Usato come integratore quando satellite o SV non bastano.
 // Richiede MAPILLARY_TOKEN in .env.local e su Vercel Dashboard.
@@ -419,9 +450,11 @@ export async function POST(req: NextRequest) {
     // Street View posizionato con direzione stradale precisa (o fallback 8-dir)
     const svImages = await fetchStreetViewImages(lat, lng, roadBearing)
 
-    // Mapillary solo se le prime due fonti danno meno di 3 immagini utili
-    const mlyImages = (satImages.length + svImages.length < 3)
-      ? await fetchMapillaryImages(lat, lng)
+    // Fallback community: Mapillary + KartaView in parallelo se le prime due fonti
+    // danno meno di 3 immagini (spesso scattate da pedoni/ciclisti = angolazione utile)
+    const fallbackImages: AnalysisImage[] = (satImages.length + svImages.length < 3)
+      ? await Promise.all([fetchMapillaryImages(lat, lng), fetchKartaViewImages(lat, lng)])
+          .then(([m, k]) => [...m, ...k].slice(0, 2))
       : []
 
     // 4. Immagini custom dell'utente (screenshot manuali)
@@ -432,15 +465,15 @@ export async function POST(req: NextRequest) {
       source: 'custom' as const,
     }))
 
-    // Ordine finale: satellite → street view → mapillary → custom
+    // Ordine finale: satellite → street view → community fallback → custom
     const allImages: AnalysisImage[] = [
       ...satImages,
       ...svImages,
-      ...mlyImages,
+      ...fallbackImages,
       ...customAnalysisImages,
     ]
 
-    console.log(`[Analyze] images: ${satImages.length} sat + ${svImages.length} sv + ${mlyImages.length} mly + ${extraImages.length} custom = ${allImages.length}`)
+    console.log(`[Analyze] images: ${satImages.length} sat + ${svImages.length} sv + ${fallbackImages.length} community + ${extraImages.length} custom = ${allImages.length}`)
 
     const imageUrls = allImages.map(img => img.url).filter(Boolean)
 
