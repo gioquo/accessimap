@@ -99,15 +99,6 @@ export async function GET(req: NextRequest) {
     if (elements.length > 0) {
       const toInsert = elements.slice(0, 100).map((el: any) => {
         const tags = el.tags || {}
-        let status: string = 'unknown'
-        if (
-          tags.kerb === 'lowered' ||
-          tags.kerb === 'flush' ||
-          tags.tactile_paving === 'yes' ||
-          tags.sloped_curb === 'yes'
-        )
-          status = 'ok'
-        else if (tags.kerb === 'raised' || tags.kerb === 'no') status = 'bad'
 
         return {
           osm_id: el.id,
@@ -115,7 +106,7 @@ export async function GET(req: NextRequest) {
           lng: el.lon,
           name: tags.name || tags['addr:street'] || null,
           osm_tags: tags,
-          status,
+          status: 'unknown', // tutti i punti richiedono verifica visiva AI
         }
       })
 
