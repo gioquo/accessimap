@@ -50,14 +50,21 @@ interface AnalysisImage {
 }
 
 // ════════════════════════════════════════════════════
-// 1. GOOGLE MAPS SATELLITE
-// Fonte primaria: vista dall'alto, ideale per vedere la forma del cordolo,
-// le strisce pedonali, le piastrelle tattili e la larghezza dei passaggi.
-// Richiede "Maps Static API" abilitata nel Google Cloud Console
-// (stessa chiave di Street View se il progetto ha entrambe le API attive).
+// 1. IMMAGINI SATELLITARI
+//
+// Strategia a cascata:
+//   A) Google Maps Static API (zoom 20+19) — qualità massima, richiede
+//      "Maps Static API" abilitata su Google Cloud Console (stessa chiave)
+//   B) Esri World Imagery export — fallback automatico, GRATUITO, no API key,
+//      stesso servizio già usato per i tile della mappa in MapClient.tsx.
+//      URL export: /MapServer/export?bbox=lng1,lat1,lng2,lat2&...&f=image
+//
+// Con Esri specifichiamo una bbox in metri attorno al crossing:
+//   - dettaglio: raggio 25m → 50×50m → ~12px/m a 640px (vede rampe da 80cm)
+//   - contesto:  raggio 55m → 110×110m → mostra l'incrocio completo
 // ════════════════════════════════════════════════════
 
-function buildSatelliteUrl(lat: number, lng: number, zoom: number): string {
+function buildGoogleSatelliteUrl(lat: number, lng: number, zoom: number): string {
   const key = process.env.GOOGLE_STREETVIEW_KEY
   return (
     `https://maps.googleapis.com/maps/api/staticmap` +
@@ -65,20 +72,47 @@ function buildSatelliteUrl(lat: number, lng: number, zoom: number): string {
   )
 }
 
+function buildEsriSatelliteUrl(lat: number, lng: number, radiusMeters: number): string {
+  // Converte metri in gradi alla latitudine corrente
+  const dLat = radiusMeters / 111320
+  const dLng = radiusMeters / (111320 * Math.cos(toRad(lat)))
+  const bbox = `${lng - dLng},${lat - dLat},${lng + dLng},${lat + dLat}`
+  return (
+    `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/export` +
+    `?bbox=${bbox}&bboxSR=4326&imageSR=4326&size=640,640&format=jpg&f=image`
+  )
+}
+
 async function fetchSatelliteImages(lat: number, lng: number): Promise<AnalysisImage[]> {
-  const images: AnalysisImage[] = []
-  const configs = [
-    { zoom: 20, desc: 'Satellite zoom 20 — dettaglio crossing (strisce, bordi marciapiede, piastrelle tattili)' },
-    { zoom: 19, desc: 'Satellite zoom 19 — contesto area (incrocio, sensi di marcia, larghezze)' },
+  // Tenta Google Maps Static API (massima qualità)
+  try {
+    const [img20, img19] = await Promise.all([
+      imageToBase64(buildGoogleSatelliteUrl(lat, lng, 20)),
+      imageToBase64(buildGoogleSatelliteUrl(lat, lng, 19)),
+    ])
+    console.log('[Satellite] Google OK')
+    return [
+      { ...img20, url: buildGoogleSatelliteUrl(lat, lng, 20), description: 'Satellite Google zoom 20 — dettaglio crossing', source: 'satellite' as const },
+      { ...img19, url: buildGoogleSatelliteUrl(lat, lng, 19), description: 'Satellite Google zoom 19 — contesto area',      source: 'satellite' as const },
+    ]
+  } catch (e) {
+    console.log('[Satellite] Google fallisce (Maps Static API non abilitata?), uso Esri:', (e as Error).message)
+  }
+
+  // Fallback Esri World Imagery — gratuito, no API key richiesta
+  const esriConfigs = [
+    { radius: 25, desc: 'Satellite Esri dettaglio (~50m area, ~12px/m — vede rampe e piastrelle tattili)' },
+    { radius: 55, desc: 'Satellite Esri contesto (~110m area — incrocio completo e sensi di marcia)' },
   ]
-  for (const { zoom, desc } of configs) {
-    const url = buildSatelliteUrl(lat, lng, zoom)
+  const images: AnalysisImage[] = []
+  for (const { radius, desc } of esriConfigs) {
+    const url = buildEsriSatelliteUrl(lat, lng, radius)
     try {
       const img = await imageToBase64(url)
-      images.push({ ...img, url, description: desc, source: 'satellite' })
-      console.log(`[Satellite] zoom ${zoom} OK`)
+      images.push({ ...img, url, description: desc, source: 'satellite' as const })
+      console.log(`[Satellite] Esri r${radius}m OK`)
     } catch (e) {
-      console.log(`[Satellite] zoom ${zoom} err:`, (e as Error).message)
+      console.log(`[Satellite] Esri r${radius}m err:`, (e as Error).message)
     }
   }
   return images
