@@ -116,29 +116,34 @@ function pitchForDistance(dist: number): number {
   return -Math.round(Math.atan2(1.4, Math.max(dist, 3)) * 180 / Math.PI)
 }
 
-// Genera fino a 6 immagini Street View ottimizzate per vedere le rampe/cordoli.
+// Genera 6 immagini Street View ottimizzate per vedere rampe e cordoli.
 //
-// Strategia:
-// - Cerca panorami dal target verso l'esterno (non il contrario): trova pani sulla STRADA
-//   che guardano verso il marciapiede — questa è la visuale "pedone che si avvicina al crossing"
-// - Pitch fisico (arctan formula): punta esattamente al livello del suolo alla distanza del target,
-//   così si vede il cordolo/rampa in primo piano, non l'asfalto davanti
-// - FOV=80° per il colpo principale: cattura entrambi i lati del marciapiede in un'unica immagine
-// - Pano sul crossing (dist<8m): 4 cardinali orizzontali — almeno 2 saranno parallele al marciapiede
+// Logica di acquisizione:
+// 1. Target diretto → trova il pano SUL crossing (visuale dall'alto delle strisce)
+// 2. Poi 4 cardinali a 15m e 25m → trova pani sulla STRADA che guardano verso il marciapiede
+//
+// Pano sul crossing (dist < 8m):
+//   Genera 2 shot a pitch=-22° nelle direzioni N/S oppure E/O (parallele al marciapiede)
+//   = visuale "macchina sopra le strisce che guarda lateralmente verso il cordolo"
+//   + 2 shot a pitch=-8° nelle direzioni perpendicolari per il contesto
+//
+// Pano sulla strada (dist ≥ 8m):
+//   Shot principale con pitch fisico (punta esattamente al suolo dove si trova il cordolo)
+//   + shot laterali ±40° per vedere i dettagli di ciascun lato della rampa
 async function generateShots(targetLat: number, targetLng: number): Promise<StreetViewShot[]> {
   const shots: StreetViewShot[] = []
   const seenPanos = new Set<string>()
 
-  // Priorità: punti a 15m e 25m nelle 4 direzioni (trovano pani sulla strada)
-  // poi target diretto come fallback, infine raggio largo
-  const searchPoints: Array<{ lat: number; lng: number; radius: number }> = []
+  // Target prima (pano sul crossing), poi cardinali a 15m/25m (pani sulla strada)
+  const searchPoints: Array<{ lat: number; lng: number; radius: number }> = [
+    { lat: targetLat, lng: targetLng, radius: 20 },
+  ]
   for (const angle of [0, 90, 180, 270]) {
     const p15 = offsetPoint(targetLat, targetLng, 15, angle)
     const p25 = offsetPoint(targetLat, targetLng, 25, angle)
     searchPoints.push({ lat: p15.lat, lng: p15.lng, radius: 15 })
     searchPoints.push({ lat: p25.lat, lng: p25.lng, radius: 18 })
   }
-  searchPoints.push({ lat: targetLat, lng: targetLng, radius: 20 })
   searchPoints.push({ lat: targetLat, lng: targetLng, radius: 80 })
 
   for (const sp of searchPoints) {
@@ -152,45 +157,46 @@ async function generateShots(targetLat: number, targetLng: number): Promise<Stre
     const pitch = pitchForDistance(dist)
 
     if (dist < 8) {
-      // Pano sul crossing: heading inaffidabile → 4 cardinali a pitch orizzontale
-      // Almeno 2 direzioni saranno parallele al marciapiede
+      // Pano SUL crossing: genera 4 shot cardinali con pitch ripido (-22°)
+      // = camera sopra le strisce che guarda verso il marciapiede lateralmente
+      // Almeno 2 delle 4 direzioni saranno parallele alle strisce pedonali
       const cardinals = [
-        { h: 0, label: 'Nord' }, { h: 90, label: 'Est' },
-        { h: 180, label: 'Sud' }, { h: 270, label: 'Ovest' },
+        { h: 0,   label: 'Nord',  pitchVal: -22 },
+        { h: 180, label: 'Sud',   pitchVal: -22 },
+        { h: 90,  label: 'Est',   pitchVal: -8  },
+        { h: 270, label: 'Ovest', pitchVal: -8  },
       ]
-      for (const { h, label } of cardinals) {
+      for (const { h, label, pitchVal } of cardinals) {
         if (shots.length >= 6) break
         shots.push({
-          url: buildStreetViewUrl(pano.pano_id, h, -3, 80),
+          url: buildStreetViewUrl(pano.pano_id, h, pitchVal, 80),
           pano_id: pano.pano_id,
           observer_lat: pano.lat,
           observer_lng: pano.lng,
           heading: h,
           distFromTarget: Math.round(dist),
-          description: `Sul crossing, verso ${label}, pitch -3°, FOV 80°`,
+          description: `Sul crossing verso ${label}, pitch ${pitchVal}°, FOV 80°`,
         })
       }
       continue
     }
 
-    // Pano sulla strada: heading verso target con pitch fisico
-    // Colpo principale FOV=80° (vede entrambi i lati del marciapiede)
-    // Colpi laterali ±40° FOV=65° per i dettagli dei singoli lati della rampa
+    // Pano sulla strada: pitch fisico verso il cordolo + shot laterali per dettaglio rampe
     const headingCenter = bearingTo(pano.lat, pano.lng, targetLat, targetLng)
 
     const panoCuts: Array<{ headingOffset: number; pitch: number; fov: number; label: string }> =
       seenPanos.size === 1
         ? [
-            { headingOffset: 0,   pitch,     fov: 80, label: 'principale (FOV largo)' },
-            { headingOffset: -40, pitch: -3, fov: 65, label: 'lato sinistro rampa' },
-            { headingOffset: 40,  pitch: -3, fov: 65, label: 'lato destro rampa' },
+            { headingOffset: 0,   pitch,          fov: 80, label: 'frontale FOV largo' },
+            { headingOffset: -40, pitch: -4,       fov: 65, label: 'lato sinistro' },
+            { headingOffset: 40,  pitch: -4,       fov: 65, label: 'lato destro' },
           ]
         : shots.length < 4
         ? [
-            { headingOffset: 0,   pitch,     fov: 80, label: 'principale' },
-            { headingOffset: -35, pitch: -3, fov: 65, label: 'lato' },
+            { headingOffset: 0,   pitch,          fov: 80, label: 'frontale' },
+            { headingOffset: -35, pitch: -4,       fov: 65, label: 'lato' },
           ]
-        : [{ headingOffset: 0, pitch, fov: 75, label: 'principale' }]
+        : [{ headingOffset: 0, pitch, fov: 75, label: 'frontale' }]
 
     for (const cut of panoCuts) {
       if (shots.length >= 6) break
@@ -355,53 +361,72 @@ export async function POST(req: NextRequest) {
         ...extraImages.map((_, i) => `  Immagine ${svCount + i + 1}: screenshot manuale dell'utente`),
       ].join('\n')
 
-      prompt = `Sei un esperto di accessibilità urbana. Devi valutare se l'attraversamento pedonale alle coordinate ${crossing.lat.toFixed(5)}, ${crossing.lng.toFixed(5)} a Roma è accessibile a persone in carrozzina o con passeggino.
+      // Contesto OSM: aiuta l'AI a capire cosa aspettarsi
+      const osmHint = (() => {
+        const t = crossing.osm_tags || {}
+        if (t.kerb === 'lowered' || t.kerb === 'flush') return '⚠️ Tag OSM: kerb=lowered/flush — i dati OSM suggeriscono rampa presente, ma VERIFICA visivamente.'
+        if (t.kerb === 'raised' || t.kerb === 'no') return '⚠️ Tag OSM: kerb=raised/no — i dati OSM suggeriscono NESSUNA rampa. Sii molto scettico verso "Accessibile".'
+        if (t.tactile_paving === 'yes') return '⚠️ Tag OSM: tactile_paving=yes — potrebbe esserci una rampa, ma verifica.'
+        return `Tag OSM disponibili: ${JSON.stringify(t)}`
+      })()
 
-Hai ${imagesData.length} immagini Google Street View dell'area, scattate con inclinazione verso il basso per mostrare il bordo del marciapiede:
+      prompt = `Sei un esperto di accessibilità urbana con un compito critico: valutare se l'attraversamento pedonale a Roma (${crossing.lat.toFixed(5)}, ${crossing.lng.toFixed(5)}) è DAVVERO accessibile a persone in carrozzina o con passeggino.
+
+${osmHint}
+
+Hai ${imagesData.length} immagini Street View. Le prime ${Math.min(4, svCount)} sono scattate con la camera SUL crossing (sopra le strisce) che guarda lateralmente verso i marciapiedi. Le successive sono scattate dalla strada guardando verso l'attraversamento:
 ${shotList}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-COSA IDENTIFICARE — RAMPE E CORDOLI
+DEFINIZIONI PRECISE — LEGGI CON ATTENZIONE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✅ RAMPA PRESENTE (cordolo abbassato):
-  • Il bordo del marciapiede scende gradualmente fino al livello dell'asfalto
-  • Superficie inclinata in calcestruzzo o asfalto, spesso con texture ruvida
-  • A volte piastrelle tattili gialle/arancioni posizionate di fronte
+✅ RAMPA CONFERMATA — devi vedere TUTTI questi elementi:
+  1. Il bordo del marciapiede scende GRADUALMENTE (non bruscamente) fino al livello dell'asfalto
+  2. La superficie di transizione è inclinata e ha una larghezza ≥ 80 cm
+  3. Non basta vedere un bordo basso o un angolo — deve essere una SUPERFICIE PRATICABILE
 
-❌ NESSUNA RAMPA (cordolo rialzato):
-  • Il bordo del marciapiede forma un gradino verticale di 5-15 cm
-  • Transizione netta e brusca tra marciapiede e carreggiata
+❌ NON È UNA RAMPA se vedi:
+  • Un gradino verticale (anche piccolo, 3-15 cm)
+  • Un bordo del marciapiede che termina bruscamente
+  • Un'area di accesso privato (cancello, garage, parcheggio) — non vale come rampa pedonale
+  • Un abbassamento solo parziale o su un lato solo
 
-⚠️ ATTENZIONE AGLI OSTACOLI TRANSITORI:
-  • Auto parcheggiate o persone NON invalidano la valutazione se il cordolo è visibile ai lati
-  • Valuta l'infrastruttura permanente, ignora veicoli e pedoni
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PROCEDURA (2 FASI OBBLIGATORIE)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-FASE 1 — SCREENING
-Per ogni immagine: il cordolo/bordo marciapiede è visibile anche parzialmente?
-Scarta solo immagini dove è completamente invisibile (buio totale, solo cielo/muri/alberi).
-
-FASE 2 — VALUTAZIONE (solo immagini utili)
-• Il cordolo è abbassato (rampa) o verticale (scalino)?
-• Condizioni del manto stradale e del marciapiede
-• Pavimentazione tattile per ipovedenti presente?
-• Larghezza del passaggio (sufficiente per carrozzina ≥80 cm?)
-• Ostacoli permanenti: pali, fioriere, radici sporgenti (NON auto/persone)
+🚫 ERRORI COMUNI DA EVITARE:
+  • NON confondere muri bassi, muretti, o bordure con rampe
+  • NON concludere "rampa presente" solo perché l'angolo di ripresa sembra mostrare un'inclinazione — potrebbe essere prospettiva
+  • NON concludere "Accessibile" se la rampa non è chiaramente visibile almeno in UNA immagine
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-FORMATO RISPOSTA (rispetta esattamente)
+PROCEDURA OBBLIGATORIA (3 FASI)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-**Screening**: [immagini utili e perché le altre scartate, max 2 righe]
-**Cosa vedo**: [descrizione concreta del cordolo/rampa nelle immagini utili, 1-2 frasi]
-**Rampa presente**: Sì / No / Non visibile
+
+FASE 1 — IDENTIFICA IL CROSSING
+In quale/i immagine/i vedi chiaramente le strisce pedonali bianche e i due bordi del marciapiede ai lati? Se non le trovi, le altre immagini potrebbero non mostrare il punto corretto.
+
+FASE 2 — ESAMINA I BORDI DEL MARCIAPIEDE
+Per ogni lato dell'attraversamento visibile: il bordo è abbassato (rampa) o è un gradino verticale?
+Descrivi ESATTAMENTE cosa vedi: "vedo un gradino verticale alto circa X cm" oppure "vedo una superficie inclinata larga Y cm".
+
+FASE 3 — VERDETTO CONSERVATIVO
+Regola: in caso di dubbio, scegli sempre il verdetto PIÙ CAUTELATIVO:
+• Se vedi chiaramente rampa su entrambi i lati → 🟢 Accessibile
+• Se vedi rampa su un lato solo, o rampa di qualità scarsa → 🟡 Parzialmente accessibile
+• Se vedi gradini o nessuna rampa → 🔴 Non accessibile
+• Se le immagini non mostrano chiaramente i bordi → ⚪ Non determinabile
+• REGOLA CRITICA: se hai dubbi tra 🟢 e 🟡, scegli sempre 🟡. Se hai dubbi tra 🟡 e 🔴, scegli 🟡. MAI esagerare verso il verde se non sei certo.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FORMATO RISPOSTA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+**Crossing identificato**: [in quale/i immagine/i sono visibili le strisce e i bordi]
+**Screening**: [quali immagini utili e perché le altre scartate]
+**Cosa vedo**: [descrizione PRECISA del bordo marciapiede — gradino o rampa, con dimensioni stimate]
+**Rampa presente**: Sì (chiaramente visibile) / Parziale (un lato o qualità scarsa) / No / Non visibile
 **Qualità manto**: Buona / Deteriorata / Parziale / Non valutabile
 **Ostacoli permanenti**: [elenco o "nessuno"]
 **Esito**: 🟢 Accessibile / 🟡 Parzialmente accessibile / 🔴 Non accessibile / ⚪ Non determinabile
 
-REGOLA ASSOLUTA: se meno di 2 immagini sono utilizzabili → rispondi obbligatoriamente ⚪ Non determinabile.`
+REGOLA ASSOLUTA: meno di 2 immagini utili → ⚪ Non determinabile. Dubbio tra due esiti → scegli il più cautelativo.`
     } else {
       prompt = `Attraversamento pedonale a Roma (${crossing.lat.toFixed(5)}, ${crossing.lng.toFixed(5)}).
 Nessuna immagine Street View disponibile in un raggio di 80m.
