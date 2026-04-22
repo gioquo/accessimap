@@ -38,6 +38,58 @@ function pitchForDist(dist: number) {
 }
 
 // ════════════════════════════════════════════════════
+// DIREZIONE STRADALE DA OSM
+// Interroga Overpass per trovare la strada che contiene il nodo del crossing.
+// Restituisce il bearing (gradi) della strada → usato per posizionare le
+// fotocamere Street View perpendicolarmente alla strada, guardando le rampe.
+// ════════════════════════════════════════════════════
+
+const OVERPASS_ENDPOINTS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://overpass.private.coffee/api/interpreter',
+]
+
+async function getRoadBearing(osmId: number | null, lat: number, lng: number): Promise<number | null> {
+  if (!osmId) return null
+  const query = `[out:json][timeout:8];node(${osmId});way(bn)["highway"];out geom;`
+  for (const endpoint of OVERPASS_ENDPOINTS) {
+    try {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'AccessiMap/1.0' },
+        body: 'data=' + encodeURIComponent(query),
+        signal: AbortSignal.timeout(7000),
+      })
+      if (!res.ok) continue
+      const data = await res.json()
+      const ways = (data.elements || []).filter(
+        (el: any) => el.type === 'way' && Array.isArray(el.geometry) && el.geometry.length >= 2
+      )
+      if (ways.length === 0) return null
+
+      const geom: Array<{ lat: number; lon: number }> = ways[0].geometry
+
+      // Trova il segmento del way più vicino al crossing
+      let minDist = Infinity, closestIdx = 0
+      for (let i = 0; i < geom.length; i++) {
+        const d = distanceMeters(geom[i].lat, geom[i].lon, lat, lng)
+        if (d < minDist) { minDist = d; closestIdx = i }
+      }
+      const i1 = Math.max(0, closestIdx - 1)
+      const i2 = Math.min(geom.length - 1, closestIdx + 1)
+      if (i1 === i2) return null
+
+      const b = bearingTo(geom[i1].lat, geom[i1].lon, geom[i2].lat, geom[i2].lon)
+      console.log(`[Road] osm_id=${osmId} bearing=${b.toFixed(0)}° (via ${endpoint.split('/')[2]})`)
+      return b
+    } catch { continue }
+  }
+  console.log(`[Road] osm_id=${osmId} — bearing non trovato`)
+  return null
+}
+
+// ════════════════════════════════════════════════════
 // TIPO IMMAGINE UNIFICATO
 // ════════════════════════════════════════════════════
 
@@ -143,31 +195,60 @@ function buildStreetViewUrl(pano_id: string, heading: number, pitch: number, fov
   )
 }
 
-// Recupera immagini Street View ottimizzate per vedere il PROFILO del cordolo.
+// Recupera immagini Street View con posizionamento guidato dalla direzione stradale.
 //
-// Principio chiave: per distinguere gradino (no rampa) da rampa inclinata
-// bisogna vedere il LATO del cordolo, non la superficie dall'alto.
-// → Pitch quasi orizzontale (0°) da road level mostra chiaramente il profilo.
-// → Pitch -50° dal crossing mostra solo sanpietrini/asfalto = AI si confonde.
+// Se roadBearing è disponibile (dalla query OSM):
+//   → Cerca pani ESATTAMENTE sulla strada (offset nel senso della strada)
+//   → Guarda PERPENDICOLARMENTE alla strada (verso le rampe ai lati del crossing)
+//   → Questo è il modo corretto: stai sulla strada e guardi verso il marciapiede
 //
-// Ordine ricerca: 8 direzioni a 12m → 4 cardinali a 22m → fallback raggio largo.
-// Panorami sul crossing (dist<5m) usati SOLO se non si trova nient'altro, con pitch -10°.
-async function fetchStreetViewImages(targetLat: number, targetLng: number): Promise<AnalysisImage[]> {
+// Se roadBearing non disponibile: fallback a 8 direzioni ogni 45°
+//
+// Pitch 0° sempre: mostra il PROFILO del cordolo (gradino vs rampa),
+// non la superficie dall'alto che confonde l'AI.
+async function fetchStreetViewImages(
+  targetLat: number,
+  targetLng: number,
+  roadBearing: number | null
+): Promise<AnalysisImage[]> {
   const images: AnalysisImage[] = []
   const seenPanos = new Set<string>()
 
-  // Cerca pani SULLA STRADA (offset dal crossing) — dà la vista "pedone che si avvicina"
-  // 8 direzioni a 12m (ogni 45°) + 4 cardinali a 22m + fallback sul crossing
-  const searchPoints: Array<{ lat: number; lng: number; radius: number }> = []
-  for (const angle of [0, 45, 90, 135, 180, 225, 270, 315]) {
-    const p = offsetPoint(targetLat, targetLng, 12, angle)
-    searchPoints.push({ lat: p.lat, lng: p.lng, radius: 12 })
+  const searchPoints: Array<{ lat: number; lng: number; radius: number; label: string }> = []
+
+  if (roadBearing !== null) {
+    // Conosciamo la direzione della strada → posizionamento preciso
+    // La strada va a roadBearing → le rampe sono ai lati (bearing ±90°)
+    // I panorami utili sono SULLA STRADA, davanti e dietro al crossing
+    const roadDir = roadBearing % 180 // normalizza 0-180
+    const perpDir = (roadDir + 90) % 360
+
+    // 2 posizioni sulla strada (davanti e dietro) × 2 distanze
+    for (const dist of [12, 20]) {
+      for (const b of [roadDir, (roadDir + 180) % 360]) {
+        const p = offsetPoint(targetLat, targetLng, dist, b)
+        searchPoints.push({ lat: p.lat, lng: p.lng, radius: 14, label: `sulla strada ${b.toFixed(0)}° a ${dist}m` })
+      }
+    }
+    // 2 posizioni perpendicolari (per crossings su strade oblique)
+    for (const dist of [12, 20]) {
+      for (const b of [perpDir, (perpDir + 180) % 360]) {
+        const p = offsetPoint(targetLat, targetLng, dist, b)
+        searchPoints.push({ lat: p.lat, lng: p.lng, radius: 14, label: `perp. ${b.toFixed(0)}° a ${dist}m` })
+      }
+    }
+  } else {
+    // Direzione sconosciuta: 8 direzioni ogni 45° per coprire tutti i casi
+    for (const angle of [0, 45, 90, 135, 180, 225, 270, 315]) {
+      const p = offsetPoint(targetLat, targetLng, 12, angle)
+      searchPoints.push({ lat: p.lat, lng: p.lng, radius: 12, label: `${angle}° a 12m` })
+    }
+    for (const angle of [0, 90, 180, 270]) {
+      const p = offsetPoint(targetLat, targetLng, 22, angle)
+      searchPoints.push({ lat: p.lat, lng: p.lng, radius: 15, label: `${angle}° a 22m` })
+    }
   }
-  for (const angle of [0, 90, 180, 270]) {
-    const p = offsetPoint(targetLat, targetLng, 22, angle)
-    searchPoints.push({ lat: p.lat, lng: p.lng, radius: 15 })
-  }
-  searchPoints.push({ lat: targetLat, lng: targetLng, radius: 80 }) // fallback
+  searchPoints.push({ lat: targetLat, lng: targetLng, radius: 80, label: 'fallback raggio largo' })
 
   for (const sp of searchPoints) {
     if (images.length >= 4) break
@@ -178,20 +259,17 @@ async function fetchStreetViewImages(targetLat: number, targetLng: number): Prom
 
     const dist = distanceMeters(pano.lat, pano.lng, targetLat, targetLng)
     const heading = bearingTo(pano.lat, pano.lng, targetLat, targetLng)
+    const pitch = dist < 5 ? -10 : 0  // sempre quasi orizzontale: mostra profilo cordolo
 
-    // Pitch orizzontale o leggermente negativo: mostra il PROFILO del cordolo
-    // (gradino verticale vs superficie inclinata) invece della superficie dall'alto
-    const pitch = dist < 5 ? -10 : 0
-
-    // Dal primo pano: 3 shot (frontale wide + lato sx + lato dx)
-    // Dai pani successivi: 1 shot frontale per avere un secondo punto di vista
+    // Primo pano trovato: 3 shot (frontale + sx + dx) per vedere entrambe le rampe
+    // Pani successivi: 1 shot frontale per secondo punto di vista
     const cuts = images.length === 0
       ? [
-          { ho: 0,   fov: 80, label: `frontale da ${Math.round(dist)}m (vede profilo cordolo)` },
-          { ho: -35, fov: 65, label: `lato sx da ${Math.round(dist)}m` },
-          { ho: 35,  fov: 65, label: `lato dx da ${Math.round(dist)}m` },
+          { ho: 0,   fov: 80, label: `frontale da ${Math.round(dist)}m — profilo cordolo` },
+          { ho: -35, fov: 65, label: `lato sx da ${Math.round(dist)}m — rampa sinistra` },
+          { ho: 35,  fov: 65, label: `lato dx da ${Math.round(dist)}m — rampa destra` },
         ]
-      : [{ ho: 0, fov: 80, label: `frontale da ${Math.round(dist)}m (secondo angolo)` }]
+      : [{ ho: 0, fov: 80, label: `da ${Math.round(dist)}m — angolo alternativo` }]
 
     for (const { ho, fov, label } of cuts) {
       if (images.length >= 4) break
@@ -331,11 +409,14 @@ export async function POST(req: NextRequest) {
     const { lat, lng } = crossing
     console.log(`[Analyze] crossing ${crossingId} at (${lat}, ${lng})`)
 
-    // 3. Raccolta immagini — tre fonti in parallelo
-    const [satImages, svImages] = await Promise.all([
+    // 3. Satellite + direzione stradale OSM in parallelo (nessuna dipendenza tra loro)
+    const [satImages, roadBearing] = await Promise.all([
       fetchSatelliteImages(lat, lng),
-      fetchStreetViewImages(lat, lng),
+      getRoadBearing(crossing.osm_id, lat, lng),
     ])
+
+    // Street View posizionato con direzione stradale precisa (o fallback 8-dir)
+    const svImages = await fetchStreetViewImages(lat, lng, roadBearing)
 
     // Mapillary solo se le prime due fonti danno meno di 3 immagini utili
     const mlyImages = (satImages.length + svImages.length < 3)
@@ -371,6 +452,9 @@ export async function POST(req: NextRequest) {
         .join('\n')
 
       const satCount = satImages.length
+      const roadInfo = roadBearing !== null
+        ? `Direzione strada: ${roadBearing.toFixed(0)}° — le immagini Street View guardano perpendicolarmente verso le rampe.`
+        : `Direzione strada: non determinata — immagini da direzioni multiple.`
       const osmTags = crossing.osm_tags || {}
       const osmNote = (() => {
         if (osmTags.kerb === 'lowered' || osmTags.kerb === 'flush')
@@ -385,6 +469,7 @@ export async function POST(req: NextRequest) {
       prompt = `Sei un esperto di accessibilità urbana. Valuta se l'attraversamento pedonale a Roma (${lat.toFixed(5)}, ${lng.toFixed(5)}) è accessibile a persone in carrozzina o con passeggino.
 
 ${osmNote}
+${roadInfo}
 
 Hai ${allImages.length} immagini da fonti diverse:
 ${imgList}
