@@ -143,26 +143,31 @@ function buildStreetViewUrl(pano_id: string, heading: number, pitch: number, fov
   )
 }
 
-// Genera shot Street View con due strategie:
-// A) Pano SUL crossing (dist < 8m): 4 cardinali con pitch ripido (-50° su N/S, -10° su E/O)
-//    = camera sopra le strisce che guarda lateralmente verso i bordi del marciapiede
-// B) Pano sulla STRADA (dist 8-40m): frontale con pitch fisico + laterali
+// Recupera immagini Street View ottimizzate per vedere il PROFILO del cordolo.
+//
+// Principio chiave: per distinguere gradino (no rampa) da rampa inclinata
+// bisogna vedere il LATO del cordolo, non la superficie dall'alto.
+// → Pitch quasi orizzontale (0°) da road level mostra chiaramente il profilo.
+// → Pitch -50° dal crossing mostra solo sanpietrini/asfalto = AI si confonde.
+//
+// Ordine ricerca: 8 direzioni a 12m → 4 cardinali a 22m → fallback raggio largo.
+// Panorami sul crossing (dist<5m) usati SOLO se non si trova nient'altro, con pitch -10°.
 async function fetchStreetViewImages(targetLat: number, targetLng: number): Promise<AnalysisImage[]> {
   const images: AnalysisImage[] = []
   const seenPanos = new Set<string>()
 
-  const searchPoints: Array<{ lat: number; lng: number; radius: number }> = [
-    { lat: targetLat, lng: targetLng, radius: 20 }, // pano sul crossing — prima priorità
-  ]
+  // Cerca pani SULLA STRADA (offset dal crossing) — dà la vista "pedone che si avvicina"
+  // 8 direzioni a 12m (ogni 45°) + 4 cardinali a 22m + fallback sul crossing
+  const searchPoints: Array<{ lat: number; lng: number; radius: number }> = []
+  for (const angle of [0, 45, 90, 135, 180, 225, 270, 315]) {
+    const p = offsetPoint(targetLat, targetLng, 12, angle)
+    searchPoints.push({ lat: p.lat, lng: p.lng, radius: 12 })
+  }
   for (const angle of [0, 90, 180, 270]) {
-    const p = offsetPoint(targetLat, targetLng, 15, angle)
+    const p = offsetPoint(targetLat, targetLng, 22, angle)
     searchPoints.push({ lat: p.lat, lng: p.lng, radius: 15 })
   }
-  for (const angle of [0, 90, 180, 270]) {
-    const p = offsetPoint(targetLat, targetLng, 28, angle)
-    searchPoints.push({ lat: p.lat, lng: p.lng, radius: 18 })
-  }
-  searchPoints.push({ lat: targetLat, lng: targetLng, radius: 80 })
+  searchPoints.push({ lat: targetLat, lng: targetLng, radius: 80 }) // fallback
 
   for (const sp of searchPoints) {
     if (images.length >= 4) break
@@ -172,44 +177,29 @@ async function fetchStreetViewImages(targetLat: number, targetLng: number): Prom
     seenPanos.add(pano.pano_id)
 
     const dist = distanceMeters(pano.lat, pano.lng, targetLat, targetLng)
-
-    if (dist < 8) {
-      // Pano SUL crossing: pitch ripido verso i bordi laterali
-      const shots = [
-        { h: 0,   pitch: -50, label: 'N (sopra strisce → bordo marciapiede, pitch -50°)' },
-        { h: 180, pitch: -50, label: 'S (sopra strisce → bordo marciapiede, pitch -50°)' },
-        { h: 90,  pitch: -10, label: 'E (sopra strisce → contesto, pitch -10°)' },
-        { h: 270, pitch: -10, label: 'O (sopra strisce → contesto, pitch -10°)' },
-      ]
-      for (const { h, pitch, label } of shots) {
-        if (images.length >= 4) break
-        const url = buildStreetViewUrl(pano.pano_id, h, pitch, 80)
-        try {
-          const img = await imageToBase64(url)
-          images.push({ ...img, url, description: `Street View ${label}`, source: 'streetview' })
-        } catch (e) { console.log('[SV]', (e as Error).message) }
-      }
-      continue
-    }
-
-    // Pano sulla strada: frontale con pitch fisico + laterali ±40°
     const heading = bearingTo(pano.lat, pano.lng, targetLat, targetLng)
-    const pitch = pitchForDist(dist)
+
+    // Pitch orizzontale o leggermente negativo: mostra il PROFILO del cordolo
+    // (gradino verticale vs superficie inclinata) invece della superficie dall'alto
+    const pitch = dist < 5 ? -10 : 0
+
+    // Dal primo pano: 3 shot (frontale wide + lato sx + lato dx)
+    // Dai pani successivi: 1 shot frontale per avere un secondo punto di vista
     const cuts = images.length === 0
       ? [
-          { ho: 0,   p: pitch, fov: 80, label: `frontale da ${Math.round(dist)}m, pitch ${pitch}°` },
-          { ho: -40, p: -4,    fov: 65, label: `lato sinistro da ${Math.round(dist)}m` },
-          { ho: 40,  p: -4,    fov: 65, label: `lato destro da ${Math.round(dist)}m` },
+          { ho: 0,   fov: 80, label: `frontale da ${Math.round(dist)}m (vede profilo cordolo)` },
+          { ho: -35, fov: 65, label: `lato sx da ${Math.round(dist)}m` },
+          { ho: 35,  fov: 65, label: `lato dx da ${Math.round(dist)}m` },
         ]
-      : [{ ho: 0, p: pitch, fov: 80, label: `frontale da ${Math.round(dist)}m` }]
+      : [{ ho: 0, fov: 80, label: `frontale da ${Math.round(dist)}m (secondo angolo)` }]
 
-    for (const { ho, p, fov, label } of cuts) {
+    for (const { ho, fov, label } of cuts) {
       if (images.length >= 4) break
       const h = (heading + ho + 360) % 360
-      const url = buildStreetViewUrl(pano.pano_id, h, p, fov)
+      const url = buildStreetViewUrl(pano.pano_id, h, pitch, fov)
       try {
         const img = await imageToBase64(url)
-        images.push({ ...img, url, description: `Street View ${label}`, source: 'streetview' })
+        images.push({ ...img, url, description: `Street View ${label}, pitch ${pitch}°`, source: 'streetview' })
       } catch (e) { console.log('[SV]', (e as Error).message) }
     }
   }
@@ -402,50 +392,51 @@ ${imgList}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 COME LEGGERE LE IMMAGINI
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-${satCount > 0 ? `🛰️ IMMAGINI SATELLITARI (prime ${satCount}):
-  • Le strisce bianche = strisce pedonali dell'attraversamento
-  • Cerca discontinuità nel bordo del marciapiede: una "tacca" o cambio di texture = possibile rampa
-  • Piastrelle gialle/arancioni a terra = pavimentazione tattile (indica rampa)
-  • Bordo rettilineo senza interruzioni = nessuna rampa
-  • Larghezza del passaggio misurabile dalla proporzione con le strisce (striscia tipica = 50cm)
+${satCount > 0 ? `🛰️ SATELLITARI (prime ${satCount} immagini) — vista dall'alto:
+  • Strisce bianche orizzontali = le strisce pedonali del crossing
+  • Cerca una "tacca" o discontinuità nel bordo del marciapiede dove finiscono le strisce
+  • Piastrelle gialle/arancioni = pavimentazione tattile (forte indicatore di rampa)
+  • Bordo rettilineo continuo senza interruzioni = nessuna rampa (gradino verticale)
+  • Attenzione: angoli arrotondati del selciato NON sono rampe accessibili
 
-` : ''}🏙️ IMMAGINI STREET VIEW (livello strada):
-  • Le shot dal crossing (pitch ripido) mostrano il bordo del marciapiede lateralmente
-  • Le shot dalla strada mostrano il punto di arrivo sul marciapiede
-  • Cerca: gradino verticale (NO rampa) vs superficie inclinata (SÌ rampa)
+` : ''}🏙️ STREET VIEW (pitch ≈ 0°, vista quasi orizzontale da road level):
+  • Le immagini sono scattate dalla STRADA guardando verso il marciapiede
+  • Con pitch quasi orizzontale vedi il PROFILO LATERALE del cordolo:
+    - Gradino verticale (5-20 cm) = nessuna rampa → 🔴
+    - Superficie che sale gradualmente dal piano strada = rampa → 🟢
+    - Superficie parzialmente abbassata o un solo lato = parziale → 🟡
+  • NON confondere: curve del selciato, bordure, angoli smussati con rampe praticabili
+  • NON confondere: accessi a garage/cancelli privati con rampe pedonali pubbliche
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-DEFINIZIONI PRECISE
+DEFINIZIONI — COSA COSTITUISCE UNA RAMPA
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✅ RAMPA CONFERMATA — TUTTI questi elementi visibili:
-  1. Superficie inclinata che connette marciapiede a strada (non un gradino)
-  2. Larghezza ≥ 80 cm praticabile (non un semplice angolo smussato)
-  3. Accessibile da entrambi i lati del crossing
+✅ RAMPA VALIDA: superficie inclinata, larga ≥ 80 cm, che porta il piano stradale
+   al livello del marciapiede senza gradini. Deve essere chiaramente percorribile
+   da una carrozzina.
 
-❌ NON È UNA RAMPA:
-  • Gradino verticale, anche piccolo (3-15 cm)
-  • Abbassamento solo parziale o su un lato
-  • Accesso privato (cancello, garage, parcheggio) — non vale
-
-🚫 ERRORI DA EVITARE:
-  • NON confondere muri bassi, muretti o bordure con rampe
-  • NON concludere "rampa" solo per un'inclinazione prospettica nell'immagine
-  • NON dire "Accessibile" se non vedi chiaramente almeno UNA rampa praticabile
+❌ NON SONO RAMPE:
+  • Angoli smussati del selciato o bordure arrotondate
+  • Abbassamento del cordolo solo su un angolo (< 50 cm larghezza)
+  • Accessi privati (garage, cancelli, negozi)
+  • Qualsiasi gradino, anche piccolo
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 PROCEDURA OBBLIGATORIA
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. IDENTIFICA: in quale immagine vedi chiaramente le strisce pedonali?
-2. ESAMINA: descrive ESATTAMENTE il bordo marciapiede — "vedo un gradino verticale di ~X cm" oppure "vedo una superficie inclinata larga ~Y cm"
-3. VERDETTO CAUTELATIVO: dubbio tra 🟢 e 🟡 → scegli 🟡. Dubbio tra 🟡 e 🔴 → scegli 🟡. MAI 🟢 se non sei certo al 90%.
+1. IDENTIFICA il crossing: in quale/i immagine/i vedi le strisce pedonali bianche?
+2. ESAMINA i bordi: per ogni lato dell'attraversamento visibile, descrivi ESATTAMENTE
+   cosa vedi — "gradino verticale di ~X cm" oppure "superficie inclinata larga ~Y cm"
+3. VERDETTO CAUTELATIVO: dubbio tra 🟢 e 🟡 → scegli 🟡.
+   Dubbio tra 🟡 e 🔴 → scegli 🟡. MAI 🟢 se hai meno del 90% di certezza.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FORMATO RISPOSTA
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-**Crossing identificato**: [immagine/i dove si vedono le strisce]
-**Screening**: [immagini utili vs scartate]
-**Cosa vedo**: [descrizione PRECISA bordo marciapiede con misure stimate]
-**Rampa presente**: Sì (chiaramente) / Parziale (un lato o scarsa qualità) / No / Non visibile
+**Crossing identificato**: [immagine/i dove sono visibili le strisce]
+**Screening**: [immagini utili vs scartate e perché]
+**Cosa vedo**: [descrizione PRECISA del profilo del cordolo con misure stimate]
+**Rampa presente**: Sì (chiaramente, ≥80cm, praticabile) / Parziale / No / Non visibile
 **Qualità manto**: Buona / Deteriorata / Parziale / Non valutabile
 **Ostacoli permanenti**: [lista o "nessuno"]
 **Esito**: 🟢 Accessibile / 🟡 Parzialmente accessibile / 🔴 Non accessibile / ⚪ Non determinabile
