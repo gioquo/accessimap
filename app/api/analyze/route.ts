@@ -219,20 +219,42 @@ async function fetchStreetViewImages(
   const images: AnalysisImage[] = []
   const seenPanos = new Set<string>()
 
-  // Punti di ricerca: prima il target (trova pano sul crossing),
-  // poi i punti sulla strada nella direzione del bearing
-  const searchPoints: Array<{ lat: number; lng: number; radius: number; label: string }> = [
-    { lat: targetLat, lng: targetLng, radius: 20, label: 'sul crossing' },
-  ]
+  // Punti di ricerca costruiti attorno alla direzione della strada.
+  // Raggio piccolo (7-9m) quando il bearing è noto: evita lo snap a strade laterali.
+  // Senza bearing: 8 direzioni con raggio standard.
+  const searchPoints: Array<{ lat: number; lng: number; radius: number; label: string }> = []
 
-  const dirs = roadBearing !== null
-    ? [roadBearing, (roadBearing + 180) % 360, (roadBearing + 90) % 360, (roadBearing + 270) % 360]
-    : [0, 90, 180, 270, 45, 135, 225, 315]
+  if (roadBearing !== null) {
+    const rb = roadBearing % 360
+    const rbo = (rb + 180) % 360
 
-  for (const dist of [12, 22]) {
-    for (const b of dirs) {
-      const p = offsetPoint(targetLat, targetLng, dist, b)
-      searchPoints.push({ lat: p.lat, lng: p.lng, radius: 14, label: `${Math.round(b)}° ${dist}m` })
+    // Target diretto (pano sul crossing) — primo
+    searchPoints.push({ lat: targetLat, lng: targetLng, radius: 18, label: 'target' })
+
+    // 3 distanze lungo la strada in entrambi i sensi, raggio stretto = rimane sulla strada giusta
+    for (const dist of [8, 15, 24]) {
+      for (const b of [rb, rbo]) {
+        const p = offsetPoint(targetLat, targetLng, dist, b)
+        searchPoints.push({ lat: p.lat, lng: p.lng, radius: 8, label: `strada ${Math.round(b)}° a ${dist}m` })
+      }
+    }
+    // Perpendicolare alla strada (strade trasversali) — raggio leggermente più largo
+    for (const dist of [10, 18]) {
+      for (const b of [(rb + 90) % 360, (rb + 270) % 360]) {
+        const p = offsetPoint(targetLat, targetLng, dist, b)
+        searchPoints.push({ lat: p.lat, lng: p.lng, radius: 10, label: `trasversale ${Math.round(b)}° a ${dist}m` })
+      }
+    }
+  } else {
+    // Direzione sconosciuta: 8 direzioni standard
+    searchPoints.push({ lat: targetLat, lng: targetLng, radius: 18, label: 'target' })
+    for (const angle of [0, 45, 90, 135, 180, 225, 270, 315]) {
+      const p = offsetPoint(targetLat, targetLng, 12, angle)
+      searchPoints.push({ lat: p.lat, lng: p.lng, radius: 12, label: `${angle}° 12m` })
+    }
+    for (const angle of [0, 90, 180, 270]) {
+      const p = offsetPoint(targetLat, targetLng, 22, angle)
+      searchPoints.push({ lat: p.lat, lng: p.lng, radius: 14, label: `${angle}° 22m` })
     }
   }
   searchPoints.push({ lat: targetLat, lng: targetLng, radius: 80, label: 'fallback' })
@@ -269,19 +291,29 @@ async function fetchStreetViewImages(
     }
 
     // ── LIVELLO B: pano sulla strada ──
-    // Pitch 0°: visuale orizzontale, mostra il profilo laterale del cordolo
+    // Pitch 0°: visuale orizzontale, mostra profilo del cordolo
     const heading = bearingTo(pano.lat, pano.lng, targetLat, targetLng)
-    const cuts = images.length === 0
-      ? [
-          { ho: 0,   fov: 80, label: `frontale da ${Math.round(dist)}m` },
-          { ho: -30, fov: 65, label: `lato sx da ${Math.round(dist)}m` },
-          { ho: 30,  fov: 65, label: `lato dx da ${Math.round(dist)}m` },
-        ]
-      : [{ ho: 0, fov: 80, label: `da ${Math.round(dist)}m angolo alt.` }]
 
-    for (const { ho, fov, label } of cuts) {
+    // Se il road bearing è noto, usiamo anche gli heading allineati alla strada
+    // per garantire una visuale "lungo il crossing" anche se il pano è leggermente offset
+    const roadAligned = roadBearing !== null ? [
+      { h: roadBearing % 360,          fov: 90, label: `da ${Math.round(dist)}m, strada dir.A (FOV 90°)` },
+      { h: (roadBearing + 180) % 360,  fov: 90, label: `da ${Math.round(dist)}m, strada dir.B (FOV 90°)` },
+    ] : []
+
+    const towardTarget = [
+      { h: heading,              fov: 85, label: `frontale da ${Math.round(dist)}m` },
+      { h: (heading - 30 + 360) % 360, fov: 65, label: `lato sx da ${Math.round(dist)}m` },
+      { h: (heading + 30) % 360,       fov: 65, label: `lato dx da ${Math.round(dist)}m` },
+    ]
+
+    // Prima i road-aligned (più utili), poi verso target
+    const allCuts = images.length === 0
+      ? [...roadAligned, ...towardTarget]
+      : [{ h: heading, fov: 85, label: `da ${Math.round(dist)}m alt.` }]
+
+    for (const { h, fov, label } of allCuts) {
       if (images.length >= 4) break
-      const h = (heading + ho + 360) % 360
       const url = buildStreetViewUrl(pano.pano_id, h, 0, fov)
       try {
         const img = await imageToBase64(url)
